@@ -361,7 +361,8 @@ def stitch_segments(video_list, audio_list, sample_rate, fps):
 
 def trim(frames, audio, F, sample_rate, fps):
     if len(frames) < F:
-        raise ValueError("The model returned fewer frames than requested")
+        pad = np.zeros((F - len(frames),) + frames.shape[1:], dtype=frames.dtype)
+        frames = np.concatenate([frames, pad], axis=0)
     frames = frames[:F]
     if audio is not None:
         audio = _fit_audio(audio, int(F * sample_rate / fps))

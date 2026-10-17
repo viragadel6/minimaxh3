@@ -30,12 +30,7 @@ def closest_aspect(w: int, h: int) -> str:
     target = math.log(w / h)
     return min(
         RESOLUTIONS["768p"],
-        key=lambda key: abs(
-            target
-            - math.log(
-                int(key.split(":")[0]) / int(key.split(":")[1])
-            )
-        ),
+        key=lambda key: abs(target - math.log(RESOLUTIONS["768p"][key][0] / RESOLUTIONS["768p"][key][1])),
     )
 
 

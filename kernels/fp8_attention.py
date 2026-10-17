@@ -211,7 +211,7 @@ def _attention(
 
         rowmax = tl.max(score, axis=1)
         m_new = tl.where((rowmax > m + 8.0) | (m == -1.0e9), rowmax, m)
-        alpha = tl.exp2(m - m_new)
+        alpha = tl.math.exp2(m - m_new)
         denominator = denominator * alpha
         acc = acc * alpha[:, None]
         if REPAIR:
@@ -234,9 +234,8 @@ def _attention(
         acc = tl.dot(p8, v_tile, acc)
 
         if REPAIR:
-            p_exact = tl.where(valid, tl.exp2(score - m[:, None]), 0.0)
-            delta = p_exact - p_apx
-            delta = tl.where(tl.abs(delta) >= REPAIR_TAU, delta, 0.0)
+            p_exact = tl.math.exp2(score - m[:, None])
+            delta = tl.where(p_apx >= REPAIR_TAU, p_exact - p_apx, 0.0)
             denominator = denominator + tl.sum(delta, axis=1)
             acc_r = tl.dot(
                 delta.to(tl.bfloat16), v_tile.to(tl.bfloat16), acc_r
@@ -252,7 +251,7 @@ def _attention(
     )
 
 
-def fp8_attention(q, k, v, scale=None, key_mask=None, key_bias=None, repair_tau=1.0):
+def fp8_attention(q, k, v, scale=None, key_mask=None, key_bias=None, repair_tau=-1.0):
     if not is_supported(q, k, v):
         raise ValueError("Unsupported FP8 attention inputs")
     if not math.isfinite(float(repair_tau)):

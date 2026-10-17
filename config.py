@@ -5,9 +5,9 @@ from dataclasses import asdict, dataclass, fields
 
 @dataclass(frozen=True, slots=True)
 class Settings:
-    APP_NAME: str = "videoaudiodiffusionserver"
+    APP_NAME: str = "video-audio-diffusion-server"
     GPU_TYPE: str = "B200"
-    MODEL_REPO_ID: str = "MiniMaxAI/MiniMaxH3"
+    MODEL_REPO_ID: str = "MiniMaxAI/MiniMax-H3"
     MODEL_BLOCKS_MODULE: str = "diffusers.modular_pipelines.minimax_h3"
     FL_SUBFOLDER: str = "FL2VA"
     REF_SUBFOLDER: str = "Ref2VA"
@@ -20,17 +20,17 @@ class Settings:
     CACHE_WARMUP_STEPS: int = 3
     CACHE_TAIL_STEPS: int = 2
     QUALITY_REPAIR_TAU: float = 0.5
-    FAST_REPAIR_TAU: float = 1.0
-    TURBO_REPAIR_TAU: float = 1.0
+    FAST_REPAIR_TAU: float = -1.0
+    TURBO_REPAIR_TAU: float = -1.0
     DEFAULT_PROFILE: str = "fast"
     WEIGHT_PRECISION: str = "fp8"
     FP8_EXCLUDE_PATTERNS: str = "embed,norm,adaln,modulation,time,proj_out,final,head"
     FP8_KEEP_EDGE_BLOCKS: int = 2
     ATTENTION_BACKEND: str = "fp8"
     ATTN_FP8_MIN_SEQ: int = 4096
-    COMPILE_MODE: str = "maxautotunenocudagraphs"
+    COMPILE_MODE: str = "max-autotune-no-cudagraphs"
     VAE_TILING: int = 0
-    RESIDENCY_RESERVE_GIB: float = 40.0
+    RESIDENCY_RESERVE_GIB: int = 40
     LORA_GPU_CACHE_SIZE: int = 8
     FUSED_LORAS: str = ""
     WARMUP_BUCKETS: str = "768p:16:9:124,480p:16:9:124"
@@ -42,9 +42,9 @@ class Settings:
     HOST_MEMORY_MIB: int = 262144
     CPU_CORES: int = 16
     FUNCTION_TIMEOUT: int = 3600
-    MODELS_VOLUME: str = "vamodels"
-    OUTPUTS_VOLUME: str = "vaoutputs"
-    JOBS_DICT: str = "vajobs"
+    MODELS_VOLUME: str = "va-models"
+    OUTPUTS_VOLUME: str = "va-outputs"
+    JOBS_DICT: str = "va-jobs"
     MODELS_DIR: str = "/models"
     OUTPUTS_DIR: str = "/outputs"
     FPS: int = 24

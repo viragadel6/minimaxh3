@@ -62,7 +62,7 @@ class FP8Linear(nn.Module):
         module = cls(linear.in_features, linear.out_features)
         w8, w_scale = quantize_rows(linear.weight.detach())
         module.register_buffer("w8", w8)
-        module.register_buffer("w_scale", w_scale)
+        module.register_buffer("w_scale", w_scale.t().contiguous())
         bias = None
         if linear.bias is not None:
             bias = linear.bias.detach().to(torch.bfloat16).clone()
@@ -86,20 +86,17 @@ class FP8Linear(nn.Module):
         if padding:
             flat = F.pad(flat, (0, 0, 0, padding))
         x8, x_scale = quantize_rows(flat)
-        dtype = x.dtype if x.dtype in (torch.bfloat16, torch.float16) else torch.bfloat16
         output = torch._scaled_mm(
             x8,
             self.w8.t(),
             scale_a=x_scale,
-            scale_b=self.w_scale.t().contiguous(),
-            out_dtype=dtype,
-            use_fast_accum=True,
+            scale_b=self.w_scale,
+            bias=self.bias,
+            out_dtype=torch.bfloat16,
         )
         if isinstance(output, tuple):
             output = output[0]
         output = output[:rows].reshape(*shape, self.out_features).to(x.dtype)
-        if self.bias is not None:
-            output = output + self.bias.to(output.dtype)
         return add_adapters(x, output, self._active_adapters)
 
 

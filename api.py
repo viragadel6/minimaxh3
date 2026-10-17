@@ -146,12 +146,12 @@ def create_api(generator_cls, job_store, settings, outputs_volume) -> FastAPI:
         except Exception as exc:
             raise HTTPException(500, f"Generation failed: {exc}") from exc
         headers = {
-            "XGenerationSeed": str(params["seed"]),
-            "XWidth": str(params["width"]),
-            "XHeight": str(params["height"]),
-            "XNumFrames": str(params["num_frames"]),
-            "XSteps": str(params["steps"]),
-            "XProfile": str(params["profile"]),
+            "X-Generation-Seed": str(params["seed"]),
+            "X-Width": str(params["width"]),
+            "X-Height": str(params["height"]),
+            "X-Num-Frames": str(params["num_frames"]),
+            "X-Steps": str(params["steps"]),
+            "X-Profile": str(params["profile"]),
         }
         return Response(content=data, media_type="video/mp4", headers=headers)
 

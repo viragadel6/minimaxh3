@@ -9,7 +9,7 @@ from kernels.fp8_attention import fp8_attention, is_supported
 
 
 enabled = True
-repair_tau = 1.0
+repair_tau = -1.0
 min_seq = 4096
 
 _local = threading.local()

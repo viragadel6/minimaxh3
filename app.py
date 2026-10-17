@@ -54,8 +54,8 @@ gpu_image = (
         index_url="https://download.pytorch.org/whl/cu130",
     )
     .pip_install(
-        "triton>=3.5,<3.6",
-        "git+https://github.com/huggingface/diffusers.git",
+        "triton>=3.5",
+        "git+https://github.com/huggingface/diffusers.git@main",
         "transformers",
         "accelerate",
         "safetensors",
@@ -68,7 +68,7 @@ gpu_image = (
         "numpy",
         "httpx",
         "fastapi[standard]",
-        "pydantic>=2,<3",
+        "pydantic>=2",
     )
     .env(environment)
     .add_local_python_source(*source_modules)
@@ -76,7 +76,7 @@ gpu_image = (
 
 api_image = (
     modal.Image.debian_slim(python_version="3.11")
-    .pip_install("fastapi[standard]", "pydantic>=2,<3", "httpx")
+    .pip_install("fastapi[standard]", "pydantic>=2", "httpx")
     .env(environment)
     .add_local_python_source(*source_modules)
 )
@@ -107,7 +107,6 @@ def download_weights():
     timeout=settings.FUNCTION_TIMEOUT,
     scaledown_window=settings.SCALEDOWN_WINDOW,
     min_containers=settings.MIN_CONTAINERS,
-    max_containers=1,
     memory=settings.HOST_MEMORY_MIB,
     cpu=settings.CPU_CORES,
 )
@@ -198,7 +197,6 @@ class VideoAudioGenerator:
 @app.function(
     image=api_image,
     volumes={settings.OUTPUTS_DIR: outputs_volume},
-    timeout=settings.FUNCTION_TIMEOUT,
 )
 @modal.concurrent(max_inputs=200)
 @modal.asgi_app()
