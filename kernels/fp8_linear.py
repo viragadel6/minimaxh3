@@ -1,5 +1,3 @@
-import fnmatch
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -8,135 +6,157 @@ import triton.language as tl
 
 
 @triton.jit
-def _quantize_rows(X, Y, SCALES, K: tl.constexpr, BLOCK: tl.constexpr):
+def _quantize_rows_kernel(
+    X_ptr,
+    X8_ptr,
+    Scale_ptr,
+    K: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
     row = tl.program_id(0)
-    columns = tl.arange(0, BLOCK)
-    value = tl.load(X + row * K + columns, mask=columns < K, other=0.0)
-    value = value.to(tl.float32)
-    amax = tl.max(tl.abs(value), axis=0)
-    scale = tl.maximum(amax, 1.0e-12) / 448.0
-    quantized = tl.minimum(tl.maximum(value / scale, -448.0), 448.0)
-    tl.store(
-        Y + row * K + columns,
-        quantized.to(tl.float8e4nv),
-        mask=columns < K,
-    )
-    tl.store(SCALES + row, scale)
+    offs_k = tl.arange(0, BLOCK_K)
+    mask = offs_k < K
+    x = tl.load(X_ptr + row * K + offs_k, mask=mask, other=0.0).to(tl.float32)
+    rowamax = tl.max(tl.abs(x), axis=0)
+    scale = tl.maximum(rowamax, 1.0e-12) / 448.0
+    x_q = tl.minimum(tl.maximum(x / scale, -448.0), 448.0).to(tl.float8e4nv)
+    tl.store(X8_ptr + row * K + offs_k, x_q, mask=mask)
+    tl.store(Scale_ptr + row, scale)
 
 
-def quantize_rows(x2d):
+def quantize_rows(x2d: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     if x2d.ndim != 2 or not x2d.is_cuda:
-        raise ValueError("quantize_rows requires a two-dimensional CUDA tensor")
+        raise ValueError("quantize_rows expects a 2D CUDA tensor")
     x2d = x2d.contiguous()
-    rows, columns = x2d.shape
-    if rows == 0 or columns == 0:
-        raise ValueError("Cannot quantize an empty matrix")
-    output = torch.empty_like(x2d, dtype=torch.float8_e4m3fn)
-    scales = torch.empty((rows, 1), dtype=torch.float32, device=x2d.device)
-    _quantize_rows[(rows,)](
-        x2d, output, scales,
-        K=columns, BLOCK=triton.next_power_of_2(columns),
-    )
-    return output, scales
+    M, K = x2d.shape
+    x8 = torch.empty((M, K), dtype=torch.float8_e4m3fn, device=x2d.device)
+    x_scale = torch.empty((M, 1), dtype=torch.float32, device=x2d.device)
+    if M > 0 and K > 0:
+        _quantize_rows_kernel[(M,)](
+            x2d,
+            x8,
+            x_scale,
+            K=K,
+            BLOCK_K=triton.next_power_of_2(K),
+        )
+    return x8, x_scale
 
 
-def add_adapters(x, output, adapters):
-    for a, b, scale in adapters:
-        branch = F.linear(F.linear(x.to(a.dtype), a), b)
-        output = output + branch.to(output.dtype) * scale
-    return output
+def apply_lora_adapters(
+    x: torch.Tensor,
+    out: torch.Tensor,
+    adapters: list[tuple[torch.Tensor, torch.Tensor, float]],
+) -> torch.Tensor:
+    if not adapters:
+        return out
+    for A, B, scale in adapters:
+        branch = (x.to(A.dtype) @ A.t()) @ B.t()
+        out = out + (branch * scale).to(out.dtype)
+    return out
 
 
 class FP8Linear(nn.Module):
-    def __init__(self, in_features, out_features):
+    def __init__(self, in_features: int, out_features: int) -> None:
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
-        self._active_adapters = ()
+        self.adapters: list[tuple[torch.Tensor, torch.Tensor, float]] = []
 
     @classmethod
     @torch.no_grad()
-    def from_linear(cls, linear):
-        if not linear.weight.is_cuda:
-            raise ValueError("FP8 conversion requires CUDA-resident weights")
-        module = cls(linear.in_features, linear.out_features)
-        w8, w_scale = quantize_rows(linear.weight.detach())
-        module.register_buffer("w8", w8)
-        module.register_buffer("w_scale", w_scale)
-        bias = None
+    def from_linear(cls, linear: nn.Linear) -> "FP8Linear":
+        mod = cls(linear.in_features, linear.out_features)
+        weight = linear.weight.detach()
+        if not weight.is_cuda:
+            weight = weight.cuda()
+        w8, w_scale_col = quantize_rows(weight)
+        w_scale = w_scale_col.view(1, -1).contiguous()
+        mod.register_buffer("w8", w8)
+        mod.register_buffer("w_scale", w_scale)
         if linear.bias is not None:
-            bias = linear.bias.detach().to(torch.bfloat16).clone()
-        module.register_buffer("bias", bias)
-        module.train(linear.training)
+            bias = linear.bias.detach().to(device=w8.device, dtype=torch.bfloat16).contiguous()
+        else:
+            bias = None
+        mod.register_buffer("bias", bias)
+        if hasattr(linear, "adapters") and isinstance(linear.adapters, list):
+            mod.adapters = list(linear.adapters)
         linear.weight = None
         linear.bias = None
-        return module
+        return mod
 
-    def forward(self, x):
-        if x.shape[-1] != self.in_features:
-            raise ValueError("FP8Linear input dimension mismatch")
-        if not x.is_cuda or not self.w8.is_cuda:
-            raise RuntimeError("FP8Linear must be resident on the GPU")
-        shape = x.shape[:-1]
-        flat = x.reshape(-1, self.in_features)
-        if flat.shape[0] == 0:
-            return x.new_empty((*shape, self.out_features))
-        rows = flat.shape[0]
-        padding = (-rows) % 16
-        if padding:
-            flat = F.pad(flat, (0, 0, 0, padding))
-        x8, x_scale = quantize_rows(flat)
-        dtype = x.dtype if x.dtype in (torch.bfloat16, torch.float16) else torch.bfloat16
-        output = torch._scaled_mm(
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        orig_shape = x.shape
+        x2d = x.reshape(-1, self.in_features)
+        M = x2d.shape[0]
+        pad = (-M) % 16
+        if pad:
+            x2d = F.pad(x2d, (0, 0, 0, pad))
+        x8, x_scale = quantize_rows(x2d)
+        out = torch._scaled_mm(
             x8,
             self.w8.t(),
             scale_a=x_scale,
-            scale_b=self.w_scale.t().contiguous(),
-            out_dtype=dtype,
-            use_fast_accum=True,
+            scale_b=self.w_scale,
+            bias=self.bias,
+            out_dtype=torch.bfloat16,
         )
-        if isinstance(output, tuple):
-            output = output[0]
-        output = output[:rows].reshape(*shape, self.out_features).to(x.dtype)
-        if self.bias is not None:
-            output = output + self.bias.to(output.dtype)
-        return add_adapters(x, output, self._active_adapters)
+        if isinstance(out, tuple):
+            out = out[0]
+        if pad:
+            out = out[:M]
+        out = out.reshape(*orig_shape[:-1], self.out_features).to(x.dtype)
+        return apply_lora_adapters(x, out, self.adapters)
 
 
-def find_block_list(transformer):
-    candidates = [
-        (name, module)
-        for name, module in transformer.named_modules()
-        if isinstance(module, nn.ModuleList) and len(module)
-    ]
+def find_primary_block_list(transformer: nn.Module) -> tuple[str, nn.ModuleList]:
+    homogeneous: list[tuple[str, nn.ModuleList]] = []
+    all_lists: list[tuple[str, nn.ModuleList]] = []
+    for name, mod in transformer.named_modules():
+        if isinstance(mod, nn.ModuleList) and len(mod) > 0:
+            all_lists.append((name, mod))
+            if len({type(child) for child in mod}) == 1:
+                homogeneous.append((name, mod))
+    candidates = homogeneous if homogeneous else all_lists
     if not candidates:
-        raise ValueError("The transformer has no nonempty ModuleList")
+        raise ValueError("No non-empty nn.ModuleList found in transformer")
     return max(candidates, key=lambda item: len(item[1]))
 
 
-def convert_transformer_to_fp8(transformer, exclude_patterns, keep_edge_blocks) -> int:
+def convert_transformer_to_fp8(
+    transformer: nn.Module,
+    exclude_patterns: str | list[str],
+    keep_edge_blocks: int,
+) -> int:
     if isinstance(exclude_patterns, str):
-        exclude_patterns = exclude_patterns.split(",")
-    patterns = [value.strip().lower() for value in exclude_patterns if value.strip()]
-    block_path, blocks = find_block_list(transformer)
-    count = 0
-    last = len(blocks) - keep_edge_blocks
-    for index in range(keep_edge_blocks, max(keep_edge_blocks, last)):
-        block = blocks[index]
-        for relative, module in list(block.named_modules()):
-            if not isinstance(module, nn.Linear):
+        patterns = [p.strip().lower() for p in exclude_patterns.split(",") if p.strip()]
+    else:
+        patterns = [p.strip().lower() for p in exclude_patterns if p.strip()]
+
+    list_name, blocks = find_primary_block_list(transformer)
+    total_blocks = len(blocks)
+    start_idx = max(0, int(keep_edge_blocks))
+    end_idx = max(start_idx, total_blocks - int(keep_edge_blocks))
+
+    converted = 0
+    for idx in range(start_idx, end_idx):
+        block = blocks[idx]
+        for sub_name, sub_mod in list(block.named_modules()):
+            if not isinstance(sub_mod, nn.Linear):
                 continue
-            if module.in_features % 16 or module.out_features % 16:
+            if sub_mod.in_features % 16 != 0 or sub_mod.out_features % 16 != 0:
                 continue
-            name = f"{block_path}.{index}.{relative}".lower()
-            if any(pattern in name or fnmatch.fnmatch(name, pattern) for pattern in patterns):
+            full_path = f"{list_name}.{idx}.{sub_name}".lower() if sub_name else f"{list_name}.{idx}".lower()
+            if any(pat in full_path for pat in patterns):
                 continue
-            if not relative:
-                blocks[index] = FP8Linear.from_linear(module)
+            fp8_mod = FP8Linear.from_linear(sub_mod)
+            if not sub_name:
+                blocks[idx] = fp8_mod
             else:
-                parent_name, _, child_name = relative.rpartition(".")
-                parent = block.get_submodule(parent_name) if parent_name else block
-                setattr(parent, child_name, FP8Linear.from_linear(module))
-            count += 1
-    torch.cuda.empty_cache()
-    return count
+                parent_path, _, attr = sub_name.rpartition(".")
+                parent = block.get_submodule(parent_path) if parent_path else block
+                setattr(parent, attr, fp8_mod)
+            converted += 1
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return converted

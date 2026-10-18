@@ -1,228 +1,198 @@
 import functools
-import inspect
 
 import torch
+import torch.nn as nn
 
-from kernels.fp8_linear import find_block_list
-
-
-_STATE_NAMES = {
-    "hidden_states", "video_hidden_states", "audio_hidden_states",
-    "encoder_hidden_states", "text_hidden_states", "image_hidden_states",
-    "x", "x_video", "x_audio", "img", "txt", "video", "audio",
-}
+from kernels.fp8_linear import find_primary_block_list
 
 
-def _leaves(value, path=()):
-    if isinstance(value, torch.Tensor):
-        yield path, value
-    elif type(value) in (list, tuple):
-        for index, item in enumerate(value):
-            yield from _leaves(item, path + (index,))
-    elif type(value) is dict:
-        for name, item in value.items():
-            yield from _leaves(item, path + (name,))
+def _clone_state(state):
+    if isinstance(state, torch.Tensor):
+        return state.detach().clone()
+    if isinstance(state, tuple):
+        return tuple(_clone_state(x) for x in state)
+    if isinstance(state, list):
+        return [_clone_state(x) for x in state]
+    return state
 
 
-def _lookup(value, path):
-    for item in path:
-        value = value[item]
-    return value
+def _add_state(a, b):
+    if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
+        return a + b.to(dtype=a.dtype, device=a.device)
+    if isinstance(a, tuple) and isinstance(b, tuple):
+        return tuple(_add_state(x, y) for x, y in zip(a, b))
+    if isinstance(a, list) and isinstance(b, list):
+        return [_add_state(x, y) for x, y in zip(a, b)]
+    return a
 
 
-def _layout(output, arguments):
-    candidates = []
-    for name, value in arguments.items():
-        if name in _STATE_NAMES or name.endswith("hidden_states"):
-            for path, tensor in _leaves(value):
-                candidates.append((name, path, tensor))
-
-    def build(value):
-        if isinstance(value, torch.Tensor):
-            matches = [
-                (name, path)
-                for name, path, tensor in candidates
-                if tensor.shape == value.shape
-                and tensor.dtype == value.dtype
-                and tensor.device == value.device
-            ]
-            if len(matches) != 1:
-                raise ValueError("Block state mapping is ambiguous")
-            return ("tensor", matches[0], tuple(value.shape))
-        if type(value) in (tuple, list):
-            return (type(value).__name__, [build(item) for item in value])
-        if type(value) is dict:
-            return ("dict", {name: build(item) for name, item in value.items()})
-        if value is None:
-            return ("none",)
-        raise ValueError("Unsupported transformer block output structure")
-
-    return build(output)
+def _sub_state(a, b):
+    if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
+        return a - b.to(dtype=a.dtype, device=a.device)
+    if isinstance(a, tuple) and isinstance(b, tuple):
+        return tuple(_sub_state(x, y) for x, y in zip(a, b))
+    if isinstance(a, list) and isinstance(b, list):
+        return [_sub_state(x, y) for x, y in zip(a, b)]
+    return a
 
 
-def _restore(layout, arguments):
-    kind = layout[0]
-    if kind == "tensor":
-        name, path = layout[1]
-        value = _lookup(arguments[name], path)
-        if tuple(value.shape) != layout[2]:
-            raise ValueError("Block state shape changed during a cached trajectory")
-        return value
-    if kind == "tuple":
-        return tuple(_restore(item, arguments) for item in layout[1])
-    if kind == "list":
-        return [_restore(item, arguments) for item in layout[1]]
-    if kind == "dict":
-        return {name: _restore(item, arguments) for name, item in layout[1].items()}
-    return None
+def _rel_diff(h1, h1_prev) -> float:
+    if isinstance(h1, torch.Tensor) and isinstance(h1_prev, torch.Tensor):
+        rel = torch.mean(torch.abs(h1.float() - h1_prev.float())) / torch.clamp(
+            torch.mean(torch.abs(h1_prev.float())), min=1e-6
+        )
+        return float(rel.item())
+    if isinstance(h1, (tuple, list)) and isinstance(h1_prev, (tuple, list)):
+        vals = [
+            _rel_diff(x, y)
+            for x, y in zip(h1, h1_prev)
+            if isinstance(x, torch.Tensor) and isinstance(y, torch.Tensor)
+        ]
+        return sum(vals) / max(1, len(vals))
+    return 0.0
 
 
-def _binary(left, right, operation):
-    if isinstance(left, torch.Tensor) and isinstance(right, torch.Tensor):
-        if left.shape != right.shape:
-            raise ValueError("Incompatible cached state shapes")
-        return operation(left, right)
-    if type(left) is not type(right):
-        raise ValueError("Incompatible cached state structures")
-    if type(left) in (tuple, list):
-        if len(left) != len(right):
-            raise ValueError("Incompatible cached state lengths")
-        values = [_binary(a, b, operation) for a, b in zip(left, right)]
-        return tuple(values) if type(left) is tuple else values
-    if type(left) is dict:
-        if left.keys() != right.keys():
-            raise ValueError("Incompatible cached state keys")
-        return {name: _binary(left[name], right[name], operation) for name in left}
-    if left is None and right is None:
-        return None
-    raise ValueError("Unsupported cached state")
+def _extract_input_hidden(args: tuple, kwargs: dict, reference_output=None):
+    tensors = [a for a in args if isinstance(a, torch.Tensor)]
+    for k in (
+        "hidden_states",
+        "video_hidden_states",
+        "audio_hidden_states",
+        "encoder_hidden_states",
+        "x",
+    ):
+        if k in kwargs and isinstance(kwargs[k], torch.Tensor):
+            tensors.append(kwargs[k])
+    for v in kwargs.values():
+        if isinstance(v, torch.Tensor) and all(v is not t for t in tensors):
+            tensors.append(v)
 
-
-def _clone(value):
-    if isinstance(value, torch.Tensor):
-        return value.detach().clone()
-    if type(value) is tuple:
-        return tuple(_clone(item) for item in value)
-    if type(value) is list:
-        return [_clone(item) for item in value]
-    if type(value) is dict:
-        return {name: _clone(item) for name, item in value.items()}
-    return None
-
-
-def _relative(current, previous):
-    differences = _binary(
-        current,
-        previous,
-        lambda a, b: (a.float() - b.float()).abs().mean()
-        / b.float().abs().mean().clamp_min(1.0e-6),
-    )
-    values = [value for _, value in _leaves(differences)]
-    if not values:
-        raise ValueError("No residual tensors were found")
-    return float(torch.stack(values).mean().item())
+    if isinstance(reference_output, tuple):
+        count = len(reference_output)
+        return tuple(tensors[:count])
+    if isinstance(reference_output, list):
+        count = len(reference_output)
+        return list(tensors[:count])
+    if tensors:
+        return tensors[0]
+    return args[0] if args else next(iter(kwargs.values()))
 
 
 class StepResidualCache:
-    def __init__(self):
-        self.transformer = None
-        self.blocks = None
-        self.enabled = False
-        self.end()
+    def __init__(self) -> None:
+        self.transformer: nn.Module | None = None
+        self.blocks: nn.ModuleList | None = None
+        self.active: bool = False
+        self.num_steps: int = 0
+        self.threshold: float = 0.0
+        self.warmup: int = 3
+        self.tail: int = 2
+        self.step: int = -1
+        self.acc_rel: float = 0.0
+        self.skip_step: bool = False
+        self.h1_prev = None
+        self.h1_this_step = None
+        self.residual = None
+        self._output_template = None
 
-    def attach(self, transformer):
-        if self.transformer is not None:
-            raise RuntimeError("This cache is already attached")
+    def attach(self, transformer: nn.Module) -> "StepResidualCache":
         self.transformer = transformer
-        _, self.blocks = find_block_list(transformer)
-        original = transformer.forward
+        _, self.blocks = find_primary_block_list(transformer)
+        orig_forward = transformer.forward
 
-        @functools.wraps(original)
-        def counted_forward(*args, **kwargs):
-            if self.enabled:
+        @functools.wraps(orig_forward)
+        def _transformer_forward(*args, **kwargs):
+            if self.active:
                 self.step += 1
-            return original(*args, **kwargs)
+            return orig_forward(*args, **kwargs)
 
-        transformer.forward = counted_forward
-        for index, block in enumerate(self.blocks):
-            block._va_uncached_forward = block.forward
-            signature = inspect.signature(block.forward)
-            block.forward = self._make_forward(index, block, signature)
+        transformer.forward = _transformer_forward
+
+        for idx, block in enumerate(self.blocks):
+            self.wrap_block(idx, block)
         return self
 
-    def _make_forward(self, index, block, signature):
-        @functools.wraps(block._va_uncached_forward)
-        def forward(*args, **kwargs):
-            if not self.enabled:
-                return block._va_uncached_forward(*args, **kwargs)
-            arguments = signature.bind_partial(*args, **kwargs).arguments
-            if index and self.skip:
-                state = _restore(self.layouts[index], arguments)
-                if index == len(self.blocks) - 1:
-                    return _binary(state, self.residual, torch.add)
-                return state
+    def wrap_block(self, idx: int, block: nn.Module) -> None:
+        raw_forward = getattr(block, "_uncached_forward", block.forward)
+        block._uncached_forward = raw_forward
 
-            output = block._va_uncached_forward(*args, **kwargs)
-            try:
-                if index not in self.layouts:
-                    self.layouts[index] = _layout(output, arguments)
-                state = _restore(self.layouts[index], arguments)
+        @functools.wraps(raw_forward)
+        def _block_forward(*args, **kwargs):
+            if not self.active or self.blocks is None:
+                return block._uncached_forward(*args, **kwargs)
 
-                if index == 0:
-                    current = _binary(output, state, torch.sub)
-                    rel = float("inf")
-                    if self.previous_first is not None:
-                        rel = _relative(current, self.previous_first)
-                    self.previous_first = _clone(current)
+            num_blocks = len(self.blocks)
+            last_idx = num_blocks - 1
+
+            if idx == 0:
+                h1 = block._uncached_forward(*args, **kwargs)
+                self._output_template = h1
+                if self.h1_prev is not None:
+                    rel = _rel_diff(h1, self.h1_prev)
                     self.acc_rel += rel
-                    self.skip = (
-                        self.warmup <= self.step < self.num_steps - self.tail
-                        and self.residual is not None
-                        and len(self.layouts) == len(self.blocks)
-                        and self.acc_rel < self.threshold
-                    )
-                    if not self.skip:
-                        self.acc_rel = 0.0
-                        self.boundary = _clone(output)
+                else:
+                    self.acc_rel = float("inf")
+                self.h1_prev = _clone_state(h1)
 
-                elif index == len(self.blocks) - 1:
-                    self.residual = _clone(
-                        _binary(output, self.boundary, torch.sub)
-                    )
-                    self.boundary = None
-            except (ValueError, KeyError, TypeError):
-                self.enabled = False
-                self.residual = None
-                self.boundary = None
-                self.previous_first = None
-                self.skip = False
-            return output
+                can_skip = (
+                    self.warmup <= self.step < (self.num_steps - self.tail)
+                    and self.residual is not None
+                    and self.acc_rel < self.threshold
+                )
+                if can_skip:
+                    self.skip_step = True
+                else:
+                    self.skip_step = False
+                    self.acc_rel = 0.0
+                    self.h1_this_step = _clone_state(h1)
+                return h1
 
-        return forward
+            if idx < last_idx:
+                if self.skip_step:
+                    return _extract_input_hidden(args, kwargs, self._output_template)
+                return block._uncached_forward(*args, **kwargs)
 
-    def begin(self, num_steps, threshold, warmup, tail):
+            if self.skip_step:
+                inp = _extract_input_hidden(args, kwargs, self._output_template)
+                return _add_state(inp, self.residual)
+
+            output_hidden = block._uncached_forward(*args, **kwargs)
+            if self.h1_this_step is not None:
+                self.residual = _clone_state(
+                    _sub_state(output_hidden, self.h1_this_step)
+                )
+                self.h1_this_step = None
+            return output_hidden
+
+        block.forward = _block_forward
+
+    def begin(
+        self,
+        num_steps: int,
+        threshold: float,
+        warmup: int = 3,
+        tail: int = 2,
+    ) -> None:
         self.end()
         self.num_steps = int(num_steps)
         self.threshold = float(threshold)
         self.warmup = int(warmup)
         self.tail = int(tail)
-        self.enabled = (
-            threshold > 0.0
-            and num_steps > 8
+        self.active = (
+            self.threshold > 0.0
+            and self.num_steps > 8
             and self.blocks is not None
-            and len(self.blocks) >= 3
+            and len(self.blocks) >= 2
         )
 
-    def end(self):
-        self.enabled = False
+    def end(self) -> None:
+        self.active = False
         self.step = -1
         self.num_steps = 0
         self.threshold = 0.0
-        self.warmup = 0
-        self.tail = 0
         self.acc_rel = 0.0
-        self.skip = False
-        self.layouts = {}
+        self.skip_step = False
+        self.h1_prev = None
+        self.h1_this_step = None
         self.residual = None
-        self.boundary = None
-        self.previous_first = None
+        self._output_template = None

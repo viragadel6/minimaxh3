@@ -1,27 +1,38 @@
 import asyncio
+import inspect
 from datetime import datetime, timezone
 
 import modal
 
 
-def utc_now():
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+def _utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+async def _dict_op(fn, *args, **kwargs):
+    aio = getattr(fn, "aio", None)
+    if callable(aio):
+        return await aio(*args, **kwargs)
+    if inspect.iscoroutinefunction(fn):
+        return await fn(*args, **kwargs)
+    res = await asyncio.to_thread(fn, *args, **kwargs)
+    if inspect.isawaitable(res):
+        return await res
+    return res
 
 
 class JobStore:
-    def __init__(self, settings):
-        self.dictionary = modal.Dict.from_name(
+    def __init__(self, settings) -> None:
+        self.store = modal.Dict.from_name(
             settings.JOBS_DICT, create_if_missing=True
         )
 
-    def _key(self, job_id, field):
-        return f"{job_id}:{field}"
-
-    async def create(self, job_id, request_json):
-        now = utc_now()
+    async def create(self, job_id: str, request_json: str) -> dict:
+        now = _utc_iso()
         record = {
             "id": job_id,
             "request_json": request_json,
+            "call_id": None,
             "status": "queued",
             "created_at": now,
             "updated_at": now,
@@ -29,70 +40,57 @@ class JobStore:
             "video_path": None,
             "error": None,
         }
-        await self.dictionary.put.aio(self._key(job_id, "meta"), record)
-        return await self.get(job_id)
+        await _dict_op(self.store.put, job_id, record)
+        return record
 
-    async def set_call(self, job_id, call_id):
-        if await self.get(job_id) is None:
-            return
-        await self.dictionary.put.aio(
-            self._key(job_id, "call"),
-            {"call_id": call_id, "updated_at": utc_now()},
-        )
+    async def set_call(self, job_id: str, call_id: str) -> dict | None:
+        record = await self.get(job_id)
+        if record is None:
+            return None
+        record["call_id"] = call_id
+        record["updated_at"] = _utc_iso()
+        await _dict_op(self.store.put, job_id, record)
+        return record
 
-    async def _state(self, job_id, status, **values):
-        if await self.get(job_id) is None:
-            return False
-        await self.dictionary.put.aio(
-            self._key(job_id, "state"),
-            {"status": status, "updated_at": utc_now(), **values},
-        )
-        return True
+    async def mark_running(self, job_id: str) -> dict | None:
+        record = await self.get(job_id)
+        if record is None:
+            return None
+        record["status"] = "running"
+        record["error"] = None
+        record["updated_at"] = _utc_iso()
+        await _dict_op(self.store.put, job_id, record)
+        return record
 
-    async def mark_running(self, job_id):
-        return await self._state(job_id, "running", error=None)
-
-    async def mark_succeeded(self, job_id, params, video_path):
+    async def mark_succeeded(self, job_id: str, params, video_path: str) -> dict | None:
+        record = await self.get(job_id)
+        if record is None:
+            return None
         if hasattr(params, "model_dump"):
             params = params.model_dump()
-        return await self._state(
-            job_id,
-            "succeeded",
-            result=params,
-            video_path=str(video_path),
-            error=None,
-        )
+        record["status"] = "succeeded"
+        record["result"] = params
+        record["video_path"] = str(video_path)
+        record["error"] = None
+        record["updated_at"] = _utc_iso()
+        await _dict_op(self.store.put, job_id, record)
+        return record
 
-    async def mark_failed(self, job_id, message):
-        return await self._state(
-            job_id, "failed", error=str(message)[:8192], result=None
-        )
-
-    async def get(self, job_id):
-        meta, state, call, deleted = await asyncio.gather(
-            self.dictionary.get.aio(self._key(job_id, "meta")),
-            self.dictionary.get.aio(self._key(job_id, "state")),
-            self.dictionary.get.aio(self._key(job_id, "call")),
-            self.dictionary.get.aio(self._key(job_id, "deleted")),
-        )
-        if meta is None or deleted:
+    async def mark_failed(self, job_id: str, message: str) -> dict | None:
+        record = await self.get(job_id)
+        if record is None:
             return None
-        result = dict(meta)
-        if state:
-            result.update(state)
-        if call:
-            result["call_id"] = call["call_id"]
-            result["updated_at"] = max(
-                result["updated_at"], call["updated_at"]
-            )
-        return result
+        record["status"] = "failed"
+        record["error"] = str(message)
+        record["updated_at"] = _utc_iso()
+        await _dict_op(self.store.put, job_id, record)
+        return record
 
-    async def delete(self, job_id):
-        await self.dictionary.put.aio(
-            self._key(job_id, "deleted"), {"deleted_at": utc_now()}
-        )
-        await asyncio.gather(
-            self.dictionary.pop.aio(self._key(job_id, "meta"), None),
-            self.dictionary.pop.aio(self._key(job_id, "state"), None),
-            self.dictionary.pop.aio(self._key(job_id, "call"), None),
-        )
+    async def get(self, job_id: str) -> dict | None:
+        return await _dict_op(self.store.get, job_id)
+
+    async def delete(self, job_id: str) -> None:
+        try:
+            await _dict_op(self.store.pop, job_id)
+        except KeyError:
+            pass

@@ -1,11 +1,8 @@
-import asyncio
 import base64
 import json
-import logging
 import mimetypes
 import tempfile
 from pathlib import Path
-from uuid import UUID
 
 import modal
 
@@ -13,13 +10,6 @@ from config import load_settings, settings_env
 
 
 settings = load_settings()
-
-UPSTREAM_REQUIREMENT = (
-    "This deployment requires the real MiniMaxH3 checkpoints and a diffusers build "
-    "exporting the configured ModularPipeline blocks and reference constructors. "
-    "Availability, numerical quality, and GPU performance must be validated against "
-    "that upstream implementation before production rollout."
-)
 
 app = modal.App(settings.APP_NAME)
 
@@ -30,16 +20,20 @@ outputs_volume = modal.Volume.from_name(
     settings.OUTPUTS_VOLUME, create_if_missing=True
 )
 
-environment = {
+_env = {
     **settings_env(settings),
     "HF_HOME": f"{settings.MODELS_DIR}/hf",
     "HF_HUB_ENABLE_HF_TRANSFER": "1",
-    "TOKENIZERS_PARALLELISM": "false",
-    "PYTHONUNBUFFERED": "1",
 }
 
-source_modules = (
-    "config", "shapes", "schemas", "media_io", "api", "kernels", "runtime"
+_local_sources = (
+    "config",
+    "shapes",
+    "schemas",
+    "media_io",
+    "api",
+    "kernels",
+    "runtime",
 )
 
 gpu_image = (
@@ -54,8 +48,8 @@ gpu_image = (
         index_url="https://download.pytorch.org/whl/cu130",
     )
     .pip_install(
-        "triton>=3.5,<3.6",
-        "git+https://github.com/huggingface/diffusers.git",
+        "triton>=3.5",
+        "git+https://github.com/huggingface/diffusers.git@main",
         "transformers",
         "accelerate",
         "safetensors",
@@ -68,17 +62,17 @@ gpu_image = (
         "numpy",
         "httpx",
         "fastapi[standard]",
-        "pydantic>=2,<3",
+        "pydantic>=2",
     )
-    .env(environment)
-    .add_local_python_source(*source_modules)
+    .env(_env)
+    .add_local_python_source(*_local_sources)
 )
 
 api_image = (
     modal.Image.debian_slim(python_version="3.11")
-    .pip_install("fastapi[standard]", "pydantic>=2,<3", "httpx")
-    .env(environment)
-    .add_local_python_source(*source_modules)
+    .pip_install("fastapi[standard]", "pydantic>=2", "httpx")
+    .env(_env)
+    .add_local_python_source(*_local_sources)
 )
 
 
@@ -86,15 +80,13 @@ api_image = (
     image=gpu_image,
     volumes={settings.MODELS_DIR: models_volume},
     timeout=settings.FUNCTION_TIMEOUT,
-    memory=settings.HOST_MEMORY_MIB,
-    cpu=settings.CPU_CORES,
 )
 def download_weights():
     from runtime.weights import commit_if_changed, ensure_weights
 
     paths = ensure_weights(settings)
     commit_if_changed(models_volume)
-    return {name: str(path) for name, path in paths.items()}
+    return {k: str(v) for k, v in paths.items()}
 
 
 @app.cls(
@@ -107,7 +99,6 @@ def download_weights():
     timeout=settings.FUNCTION_TIMEOUT,
     scaledown_window=settings.SCALEDOWN_WINDOW,
     min_containers=settings.MIN_CONTAINERS,
-    max_containers=1,
     memory=settings.HOST_MEMORY_MIB,
     cpu=settings.CPU_CORES,
 )
@@ -123,82 +114,44 @@ class VideoAudioGenerator:
         from runtime.model_manager import ModelManager
         from runtime.weights import commit_if_changed
 
-        logging.basicConfig(level=logging.INFO)
-        logging.getLogger(__name__).warning(UPSTREAM_REQUIREMENT)
         self.manager = ModelManager(settings)
         self.manager.load()
         commit_if_changed(models_volume)
-        self.engine = Generator(self.manager, settings)
-        self.jobs = JobStore(settings)
-
-    @modal.exit()
-    def stop(self):
-        if hasattr(self, "engine"):
-            self.engine.close()
+        self.generator = Generator(self.manager, settings)
+        self.job_store = JobStore(settings)
 
     @modal.method()
-    async def generate(self, request_json, job_id):
-        from runtime.weights import commit_if_changed
+    async def generate(self, request_json: str, job_id: str):
         from schemas import GenerationRequest
 
-        parsed = UUID(job_id)
-        if parsed.version != 4 or str(parsed) != job_id:
-            raise ValueError("job_id must be a canonical UUID4")
-        request = GenerationRequest.model_validate_json(request_json)
-        output = Path(settings.OUTPUTS_DIR) / f"{job_id}.mp4"
-        if await self.jobs.get(job_id) is None:
-            return {"cancelled": True}
-        await self.jobs.mark_running(job_id)
-
+        await self.job_store.mark_running(job_id)
+        out_path = Path(settings.OUTPUTS_DIR) / f"{job_id}.mp4"
         try:
-            params = await self.engine.render_mp4(request, output)
-            await asyncio.to_thread(commit_if_changed, models_volume)
-            if await self.jobs.get(job_id) is None:
-                output.unlink(missing_ok=True)
-                await outputs_volume.commit.aio()
-                return {"cancelled": True}
-            await outputs_volume.commit.aio()
-            saved = await self.jobs.mark_succeeded(job_id, params, output)
-            if not saved:
-                output.unlink(missing_ok=True)
-                await outputs_volume.commit.aio()
-                return {"cancelled": True}
-            return {"params": params.model_dump(), "video_path": str(output)}
-        except asyncio.CancelledError:
-            output.unlink(missing_ok=True)
-            try:
-                await asyncio.shield(self.jobs.mark_failed(job_id, "Generation cancelled"))
-                await asyncio.shield(outputs_volume.commit.aio())
-            except Exception:
-                pass
-            raise
+            req = GenerationRequest.model_validate_json(request_json)
+            params = await self.generator.render_mp4(req, out_path)
+            outputs_volume.commit()
+            await self.job_store.mark_succeeded(job_id, params, str(out_path))
+            return params.model_dump()
         except Exception as exc:
-            output.unlink(missing_ok=True)
-            try:
-                await self.jobs.mark_failed(job_id, str(exc))
-                await outputs_volume.commit.aio()
-            except Exception:
-                logging.getLogger(__name__).exception("Could not persist job failure")
+            out_path.unlink(missing_ok=True)
+            await self.job_store.mark_failed(job_id, str(exc))
             raise
 
     @modal.method()
-    async def generate_bytes(self, request_json):
-        from runtime.weights import commit_if_changed
+    async def generate_bytes(self, request_json: str):
         from schemas import GenerationRequest
 
-        request = GenerationRequest.model_validate_json(request_json)
-        with tempfile.TemporaryDirectory(prefix="va-sync-") as directory:
-            output = Path(directory) / "video.mp4"
-            params = await self.engine.render_mp4(request, output)
-            data = await asyncio.to_thread(output.read_bytes)
-            await asyncio.to_thread(commit_if_changed, models_volume)
-            return data, params.model_dump()
+        req = GenerationRequest.model_validate_json(request_json)
+        with tempfile.TemporaryDirectory(prefix="va-bytes-") as tmpdir:
+            out_path = Path(tmpdir) / "output.mp4"
+            params = await self.generator.render_mp4(req, out_path)
+            mp4_bytes = out_path.read_bytes()
+            return mp4_bytes, params.model_dump()
 
 
 @app.function(
     image=api_image,
     volumes={settings.OUTPUTS_DIR: outputs_volume},
-    timeout=settings.FUNCTION_TIMEOUT,
 )
 @modal.concurrent(max_inputs=200)
 @modal.asgi_app()
@@ -214,25 +167,24 @@ def web():
     )
 
 
-def _cli_source(value):
+def _encode_media_arg(value: str) -> str:
     if value.startswith(("http://", "https://", "data:")):
         return value
-    path = Path(value).expanduser()
-    if not path.is_file():
-        raise ValueError(f"Local media file does not exist: {path}")
-    mime = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
-    return f"data:{mime};base64,{encoded}"
+    p = Path(value).expanduser()
+    mime, _ = mimetypes.guess_type(p.name)
+    mime = mime or "application/octet-stream"
+    b64 = base64.b64encode(p.read_bytes()).decode("ascii")
+    return f"data:{mime};base64,{b64}"
 
 
 @app.local_entrypoint()
 def main(
     prompt: str,
-    output: str = "output.mp4",
+    out: str = "output.mp4",
     mode: str = "",
     resolution: str = "768p",
     aspect_ratio: str = "16:9",
-    duration_seconds: float = 5.0,
+    duration_seconds: float = 0.0,
     num_frames: int = 0,
     profile: str = "",
     steps: int = 0,
@@ -245,36 +197,31 @@ def main(
 ):
     from schemas import GenerationRequest
 
-    reference_values = json.loads(references)
-    if not isinstance(reference_values, list):
-        raise ValueError("references must be a JSON array")
-    for item in reference_values:
-        item["source"] = _cli_source(item["source"])
+    ref_list = json.loads(references)
+    for item in ref_list:
+        if "source" in item:
+            item["source"] = _encode_media_arg(item["source"])
 
-    request = GenerationRequest(
+    req = GenerationRequest(
         prompt=prompt,
         mode=mode or None,
         resolution=resolution,
         aspect_ratio=aspect_ratio,
-        duration_seconds=None if num_frames else duration_seconds,
-        num_frames=num_frames or None,
+        duration_seconds=duration_seconds if duration_seconds > 0 else None,
+        num_frames=num_frames if num_frames > 0 else None,
         profile=profile or None,
-        num_inference_steps=steps or None,
-        seed=None if seed < 0 else seed,
-        first_frame={"source": _cli_source(first_frame)} if first_frame else None,
-        last_frame={"source": _cli_source(last_frame)} if last_frame else None,
-        references=reference_values,
+        num_inference_steps=steps if steps > 0 else None,
+        seed=seed if seed >= 0 else None,
+        first_frame={"source": _encode_media_arg(first_frame)} if first_frame else None,
+        last_frame={"source": _encode_media_arg(last_frame)} if last_frame else None,
+        references=ref_list,
         loras=json.loads(loras),
         include_audio=include_audio,
     )
-    data, params = VideoAudioGenerator().generate_bytes.remote(
-        request.model_dump_json()
+    mp4_bytes, params = VideoAudioGenerator().generate_bytes.remote(
+        req.model_dump_json()
     )
-    destination = Path(output).expanduser()
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_bytes(data)
-    print(json.dumps(
-        {"output": str(destination), "params": params},
-        ensure_ascii=False,
-        indent=2,
-    ))
+    out_path = Path(out).expanduser()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_bytes(mp4_bytes)
+    print(json.dumps(params, indent=2))
