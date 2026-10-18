@@ -1,4 +1,3 @@
-import fcntl
 import functools
 import hashlib
 import json
@@ -6,9 +5,7 @@ import os
 import re
 import shutil
 import tempfile
-import threading
 from collections import OrderedDict
-from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
@@ -17,341 +14,322 @@ import torch.nn as nn
 from huggingface_hub import hf_hub_download, list_repo_files
 from safetensors.torch import load_file
 
-from config import load_settings
-from kernels.fp8_linear import FP8Linear, add_adapters
+from config import Settings, load_settings
+from kernels.fp8_linear import FP8Linear, apply_lora_adapters
 from schemas import LoraSpec
 
 
-MAX_LORA_BYTES = 8 * 1024 * 1024 * 1024
+_PREFIXES = (
+    "base_model.model.",
+    "diffusion_model.",
+    "transformer.",
+    "model.",
+)
 
-_PAIR_PATTERN = re.compile(
-    r"^(.*?)(?:"
-    r"\.lora_(A|B)(?:\.[^.]+)?\.weight|"
-    r"\.lora_(down|up)\.weight|"
-    r"\.lora\.(down|up)\.weight"
-    r")$"
+_LORA_KEY_RE = re.compile(
+    r"^(?P<base>.+?)\.(?:lora_(?P<ab>A|B)(?:\.[^.]+)?|lora_(?P<du>down|up)|lora\.(?P<du2>down|up))\.weight$"
 )
 
 
-def fused_specs(value: str) -> list[LoraSpec]:
-    if not value.strip():
+def parse_fused_loras(raw: str) -> list[LoraSpec]:
+    text = (raw or "").strip()
+    if not text:
         return []
-    try:
-        items = json.loads(value)
-    except json.JSONDecodeError as exc:
-        raise ValueError("FUSED_LORAS must be a JSON array of LoRA specifications") from exc
-    if not isinstance(items, list):
-        raise ValueError("FUSED_LORAS must be a JSON array")
-    return [
-        LoraSpec(source=item) if isinstance(item, str) else LoraSpec.model_validate(item)
-        for item in items
-    ]
-
-
-def resolve_lora(source, weight_name=None) -> Path:
-    settings = load_settings()
-    directory = Path(settings.MODELS_DIR) / "lora_cache"
-    directory.mkdir(parents=True, exist_ok=True)
-    digest = hashlib.sha256(
-        json.dumps([source, weight_name], separators=(",", ":")).encode()
-    ).hexdigest()
-    destination = directory / f"{digest}.safetensors"
-    lock_path = directory / f"{digest}.lock"
-
-    with lock_path.open("a+b") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        if destination.is_file() and destination.stat().st_size:
-            return destination
-        descriptor, temporary_name = tempfile.mkstemp(dir=directory, suffix=".part")
-        os.close(descriptor)
-        temporary = Path(temporary_name)
-        try:
-            if source.startswith(("https://", "http://")):
-                with httpx.Client(
-                    follow_redirects=True, timeout=120, max_redirects=5, trust_env=False
-                ) as client:
-                    with client.stream("GET", source) as response:
-                        response.raise_for_status()
-                        total = 0
-                        with temporary.open("wb") as output:
-                            for chunk in response.iter_bytes(1024 * 1024):
-                                total += len(chunk)
-                                if total > MAX_LORA_BYTES:
-                                    raise ValueError("LoRA exceeds the download size limit")
-                                output.write(chunk)
+    if text.startswith("["):
+        data = json.loads(text)
+        return [
+            LoraSpec(source=item) if isinstance(item, str) else LoraSpec.model_validate(item)
+            for item in data
+        ]
+    specs: list[LoraSpec] = []
+    for entry in text.split(","):
+        part = entry.strip()
+        if not part:
+            continue
+        scale = 1.0
+        weight_name = None
+        if "::" in part:
+            source_part, rest = part.split("::", 1)
+            if ":" in rest:
+                weight_name, scale_str = rest.rsplit(":", 1)
+                scale = float(scale_str)
             else:
-                repo = source.removeprefix("hf://")
-                revision = None
-                if "@" in repo:
-                    repo, revision = repo.rsplit("@", 1)
-                if len(repo.split("/")) != 2:
-                    raise ValueError("LoRA source must be a URL or an owner/repository ID")
-                filename = weight_name
-                if filename is None:
-                    candidates = [
-                        name for name in list_repo_files(repo, revision=revision)
-                        if name.endswith(".safetensors")
-                    ]
-                    preferred = [
-                        name for name in (
-                            "pytorch_lora_weights.safetensors",
-                            "adapter_model.safetensors",
-                        )
-                        if name in candidates
-                    ]
-                    if preferred:
-                        filename = preferred[0]
-                    elif len(candidates) == 1:
-                        filename = candidates[0]
-                    else:
-                        raise ValueError("Specify weight_name for this LoRA repository")
-                cached = hf_hub_download(
-                    repo_id=repo, filename=filename, revision=revision
-                )
-                if Path(cached).stat().st_size > MAX_LORA_BYTES:
-                    raise ValueError("LoRA exceeds the download size limit")
-                shutil.copyfile(cached, temporary)
-
-            if not temporary.stat().st_size:
-                raise ValueError("LoRA file is empty")
-            load_file(str(temporary), device="cpu")
-            os.replace(temporary, destination)
-            from runtime.weights import mark_changed
-            mark_changed()
-            return destination
-        finally:
-            temporary.unlink(missing_ok=True)
+                weight_name = rest
+            specs.append(LoraSpec(source=source_part, weight_name=weight_name, scale=scale))
+        elif ":" in part and not part.startswith(("http://", "https://")):
+            source_part, scale_str = part.rsplit(":", 1)
+            try:
+                scale = float(scale_str)
+                specs.append(LoraSpec(source=source_part, scale=scale))
+            except ValueError:
+                specs.append(LoraSpec(source=part))
+        else:
+            specs.append(LoraSpec(source=part))
+    return specs
 
 
-def _canonical(name):
-    prefixes = (
-        "base_model.model.", "model.diffusion_model.", "diffusion_model.",
-        "module.", "model.", "transformer.", "unet.",
-    )
+def resolve_lora(source: str, weight_name: str | None = None) -> Path:
+    settings = load_settings()
+    cache_dir = Path(settings.MODELS_DIR) / "lora_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    key_str = f"{source}::{weight_name or ''}"
+    digest = hashlib.sha256(key_str.encode("utf-8")).hexdigest()
+    target_path = cache_dir / f"{digest}.safetensors"
+    if target_path.is_file() and target_path.stat().st_size > 0:
+        return target_path
+
+    fd, tmp_name = tempfile.mkstemp(dir=str(cache_dir), suffix=".tmp")
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        if source.startswith(("http://", "https://")):
+            with httpx.Client(follow_redirects=True, timeout=120) as client:
+                resp = client.get(source)
+                resp.raise_for_status()
+                tmp_path.write_bytes(resp.content)
+        elif Path(source).is_file():
+            shutil.copyfile(source, tmp_path)
+        else:
+            repo_id = source.removeprefix("hf://")
+            filename = weight_name
+            if filename is None:
+                files = [
+                    f for f in list_repo_files(repo_id) if f.endswith(".safetensors")
+                ]
+                if not files:
+                    raise ValueError(f"No .safetensors file found in {repo_id}")
+                preferred = [
+                    f
+                    for f in files
+                    if f in ("pytorch_lora_weights.safetensors", "adapter_model.safetensors")
+                ]
+                filename = preferred[0] if preferred else files[0]
+            downloaded = hf_hub_download(repo_id=repo_id, filename=filename)
+            shutil.copyfile(downloaded, tmp_path)
+        os.replace(tmp_path, target_path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
+    return target_path
+
+
+def _strip_prefixes(key: str) -> str:
     changed = True
     while changed:
         changed = False
-        for prefix in prefixes:
-            if name.startswith(prefix):
-                name = name[len(prefix):]
+        for p in _PREFIXES:
+            if key.startswith(p):
+                key = key[len(p) :]
                 changed = True
                 break
-    for prefix in ("lora_unet_", "lora_transformer_"):
-        if name.startswith(prefix):
-            name = name[len(prefix):]
-    return name
+    return key
 
 
-def parse_lora(path, module_names) -> dict:
-    tensors = load_file(str(path), device="cpu")
-    aliases = {}
-    if module_names is not None:
-        for name in module_names:
-            canonical = _canonical(name)
-            for alias in {name, canonical, canonical.replace(".", "_")}:
-                aliases.setdefault(alias, set()).add(name)
+def parse_lora(path: str | Path, module_names: set[str] | list[str] | tuple[str, ...] | dict) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+    state_dict = load_file(str(path), device="cpu")
+    name_list = list(module_names) if module_names is not None else []
+    exact_map: dict[str, str] = {}
+    underscore_map: dict[str, str] = {}
+    for mod_name in name_list:
+        stripped = _strip_prefixes(mod_name)
+        exact_map[mod_name] = mod_name
+        exact_map[stripped] = mod_name
+        us = stripped.replace(".", "_")
+        underscore_map[us] = mod_name
+        underscore_map[f"lora_unet_{us}"] = mod_name
+        underscore_map[f"lora_transformer_{us}"] = mod_name
 
-    groups = {}
-    alphas = {}
-    unmatched = []
-    for key, value in tensors.items():
-        match = _PAIR_PATTERN.match(key)
-        if match:
-            name = _canonical(match.group(1))
-            side = next(item for item in match.groups()[1:] if item is not None)
-            side = "A" if side in {"A", "down"} else "B"
-            group = groups.setdefault(name, {})
-            if side in group:
-                unmatched.append(key)
-            else:
-                group[side] = (key, value)
-        elif key.endswith((".alpha", ".lora_alpha")):
-            name = _canonical(key.rsplit(".", 1)[0])
-            if value.numel() != 1 or name in alphas:
-                unmatched.append(key)
-            else:
-                alphas[name] = (key, float(value.item()))
+    pairs: dict[str, dict[str, tuple[str, torch.Tensor]]] = {}
+    alphas: dict[str, tuple[str, float]] = {}
+    unmatched: list[str] = []
+
+    for raw_key, tensor in state_dict.items():
+        clean_key = _strip_prefixes(raw_key)
+        m = _LORA_KEY_RE.match(clean_key)
+        if m:
+            base = _strip_prefixes(m.group("base"))
+            role_raw = m.group("ab") or m.group("du") or m.group("du2")
+            role = "A" if role_raw in ("A", "down") else "B"
+            entry = pairs.setdefault(base, {})
+            entry[role] = (raw_key, tensor)
+        elif clean_key.endswith(".alpha") or clean_key.endswith(".lora_alpha"):
+            base = _strip_prefixes(clean_key.rsplit(".", 1)[0])
+            alphas[base] = (raw_key, float(tensor.item()))
         else:
-            unmatched.append(key)
+            unmatched.append(raw_key)
 
-    result = {}
-    for raw_name, group in groups.items():
-        if "A" not in group or "B" not in group:
-            unmatched.extend(item[0] for item in group.values())
+    parsed: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+    for base, entry in pairs.items():
+        if "A" not in entry or "B" not in entry:
+            for rk, _ in entry.values():
+                unmatched.append(rk)
             continue
-        a_key, a = group["A"]
-        b_key, b = group["B"]
-        if a.ndim != 2 or b.ndim != 2 or a.shape[0] != b.shape[1]:
-            unmatched.extend((a_key, b_key))
+        rk_a, A = entry["A"]
+        rk_b, B = entry["B"]
+
+        resolved_name: str | None = None
+        if not name_list:
+            resolved_name = base.removeprefix("lora_unet_").removeprefix("lora_transformer_")
+        else:
+            if base in exact_map:
+                resolved_name = exact_map[base]
+            elif base in underscore_map:
+                resolved_name = underscore_map[base]
+            else:
+                trimmed = base.removeprefix("lora_unet_").removeprefix("lora_transformer_")
+                if trimmed in exact_map:
+                    resolved_name = exact_map[trimmed]
+                elif trimmed in underscore_map:
+                    resolved_name = underscore_map[trimmed]
+                elif trimmed.replace(".", "_") in underscore_map:
+                    resolved_name = underscore_map[trimmed.replace(".", "_")]
+
+        if resolved_name is None:
+            unmatched.extend([rk_a, rk_b])
             continue
 
-        target = raw_name
-        if module_names is not None:
-            matches = aliases.get(raw_name, set())
-            if not matches:
-                matches = aliases.get(raw_name.replace(".", "_"), set())
-            if len(matches) != 1:
-                unmatched.extend((a_key, b_key))
-                continue
-            target = next(iter(matches))
-        if target in result:
-            unmatched.extend((a_key, b_key))
-            continue
+        rank = A.shape[0]
+        alpha_entry = alphas.pop(base, None)
+        mult = (alpha_entry[1] / rank) if alpha_entry is not None else 1.0
+        A_bf16 = A.detach().to(torch.bfloat16).contiguous()
+        B_bf16 = (B.detach().float() * mult).to(torch.bfloat16).contiguous()
+        parsed[resolved_name] = (A_bf16, B_bf16)
 
-        factor = 1.0
-        if raw_name in alphas:
-            factor = alphas.pop(raw_name)[1] / a.shape[0]
-        if not torch.isfinite(a).all() or not torch.isfinite(b).all():
-            unmatched.extend((a_key, b_key))
-            continue
-        if not torch.isfinite(torch.tensor(factor)):
-            unmatched.append(raw_name + ".alpha")
-            continue
-        result[target] = (
-            a.to(torch.bfloat16).contiguous(),
-            (b.float() * factor).to(torch.bfloat16).contiguous(),
-        )
+    for rk, _ in alphas.values():
+        unmatched.append(rk)
 
-    unmatched.extend(item[0] for item in alphas.values())
     if unmatched:
-        raise ValueError("Unmatched or invalid LoRA keys: " + ", ".join(unmatched[:10]))
-    if not result:
-        raise ValueError("The LoRA file contains no compatible matrix pairs")
-    return result
+        raise ValueError(f"Unmatched LoRA keys: {', '.join(unmatched[:10])}")
+    return parsed
 
 
-def _linear_modules(transformer):
-    return {
-        name: module
-        for name, module in transformer.named_modules()
-        if isinstance(module, (nn.Linear, FP8Linear))
-    }
+def attach_lora_registry(transformer: nn.Module) -> dict[str, nn.Module]:
+    registry: dict[str, nn.Module] = {}
+    for name, mod in transformer.named_modules():
+        if isinstance(mod, (nn.Linear, FP8Linear)):
+            registry[name] = mod
+            if not hasattr(mod, "adapters") or not isinstance(mod.adapters, list):
+                mod.adapters = []
+            if isinstance(mod, nn.Linear) and not getattr(mod, "_lora_wrapped", False):
+                orig_forward = mod.forward
 
+                def _make_forward(m: nn.Linear, fn):
+                    @functools.wraps(fn)
+                    def _forward(x: torch.Tensor) -> torch.Tensor:
+                        out = fn(x)
+                        return apply_lora_adapters(x, out, m.adapters)
 
-def register_adapters(transformer):
-    modules = _linear_modules(transformer)
-    for module in modules.values():
-        if isinstance(module, FP8Linear):
-            continue
-        if hasattr(module, "_active_adapters"):
-            continue
-        module._active_adapters = ()
-        original = module.forward
+                    return _forward
 
-        def wrap(current, original_forward):
-            @functools.wraps(original_forward)
-            def forward(x):
-                output = original_forward(x)
-                return add_adapters(x, output, current._active_adapters)
-            return forward
-
-        module.forward = wrap(module, original)
-    return modules
-
-
-@dataclass(frozen=True)
-class PreparedLora:
-    key: tuple
-    weights: dict
-    scale: float
+                mod.forward = _make_forward(mod, orig_forward)
+                mod._lora_wrapped = True
+    return registry
 
 
 class LoraManager:
-    def __init__(self, settings):
-        self.capacity = settings.LORA_GPU_CACHE_SIZE
-        self.gpu_cache = OrderedDict()
-        self.cpu_cache = OrderedDict()
-        self.cpu_lock = threading.Lock()
-        self.registries = {}
+    def __init__(self, settings_or_capacity: Settings | int | None = None) -> None:
+        if isinstance(settings_or_capacity, int):
+            self.capacity = settings_or_capacity
+        elif isinstance(settings_or_capacity, Settings):
+            self.capacity = settings_or_capacity.LORA_GPU_CACHE_SIZE
+        else:
+            self.capacity = load_settings().LORA_GPU_CACHE_SIZE
+        self.gpu_cache: OrderedDict[tuple[str, int], dict[str, tuple[torch.Tensor, torch.Tensor]]] = OrderedDict()
+        self.cpu_cache: OrderedDict[tuple[str, int], dict[str, tuple[torch.Tensor, torch.Tensor]]] = OrderedDict()
+        self.registries: dict[int, dict[str, nn.Module]] = {}
 
-    def register(self, transformer):
-        registry = register_adapters(transformer)
-        self.registries[id(transformer)] = registry
-        return registry
+    def register(self, transformer: nn.Module) -> dict[str, nn.Module]:
+        reg = attach_lora_registry(transformer)
+        self.registries[id(transformer)] = reg
+        return reg
 
-    def prepare(self, transformer, specs):
-        if len(specs) > self.capacity:
-            raise ValueError("The request exceeds LORA_GPU_CACHE_SIZE")
-        registry = self.registries[id(transformer)]
-        names = tuple(sorted(registry))
+    def prepare(self, transformer: nn.Module, specs: list[LoraSpec]):
+        reg = self.registries.get(id(transformer)) or self.register(transformer)
+        mod_names = set(reg.keys())
         prepared = []
-        for item in specs:
-            spec = item if isinstance(item, LoraSpec) else LoraSpec.model_validate(item)
+        for raw_spec in specs:
+            spec = raw_spec if isinstance(raw_spec, LoraSpec) else LoraSpec.model_validate(raw_spec)
             path = resolve_lora(spec.source, spec.weight_name)
-            key = (str(path), names)
-            with self.cpu_lock:
-                weights = self.cpu_cache.get(key)
-                if weights is not None:
-                    self.cpu_cache.move_to_end(key)
-            if weights is None:
-                weights = parse_lora(path, names)
-                for name, (a, b) in weights.items():
-                    module = registry[name]
-                    if a.shape[1] != module.in_features or b.shape[0] != module.out_features:
-                        raise ValueError(f"LoRA dimensions do not match {name}")
-                with self.cpu_lock:
-                    self.cpu_cache[key] = weights
-                    self.cpu_cache.move_to_end(key)
-                    while len(self.cpu_cache) > self.capacity * 2:
-                        self.cpu_cache.popitem(last=False)
-            prepared.append(PreparedLora(key, weights, spec.scale))
+            cache_key = (str(path), id(transformer))
+            parsed = self.cpu_cache.get(cache_key)
+            if parsed is None:
+                parsed = parse_lora(path, mod_names)
+                self.cpu_cache[cache_key] = parsed
+            else:
+                self.cpu_cache.move_to_end(cache_key)
+            prepared.append((cache_key, parsed, float(spec.scale)))
         return prepared
 
     @torch.no_grad()
-    def activate(self, transformer, specs):
-        registry = self.registries[id(transformer)]
+    def activate(self, transformer: nn.Module, specs: list) -> None:
+        reg = self.registries.get(id(transformer)) or self.register(transformer)
         self.deactivate(transformer)
-        if specs and not isinstance(specs[0], PreparedLora):
-            specs = self.prepare(transformer, specs)
-        active = {name: [] for name in registry}
-        try:
-            for spec in specs:
-                weights = self.gpu_cache.get(spec.key)
-                if weights is None:
-                    while len(self.gpu_cache) >= self.capacity:
-                        self.gpu_cache.popitem(last=False)
-                    weights = {
-                        name: (
-                            a.to("cuda", dtype=torch.bfloat16),
-                            b.to("cuda", dtype=torch.bfloat16),
-                        )
-                        for name, (a, b) in spec.weights.items()
-                    }
-                    self.gpu_cache[spec.key] = weights
-                self.gpu_cache.move_to_end(spec.key)
-                for name, (a, b) in weights.items():
-                    active[name].append((a, b, float(spec.scale)))
-            for name, module in registry.items():
-                module._active_adapters = tuple(active[name])
-        except BaseException:
-            self.deactivate(transformer)
-            raise
+        if not specs:
+            return
+        if not (isinstance(specs[0], tuple) and len(specs[0]) == 3):
+            prepared = self.prepare(transformer, specs)
+        else:
+            prepared = specs
 
-    def deactivate(self, transformer):
-        for module in self.registries.get(id(transformer), {}).values():
-            module._active_adapters = ()
+        device = next(
+            (
+                t.device
+                for t in list(transformer.parameters()) + list(transformer.buffers())
+                if t is not None
+            ),
+            torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+        )
 
-    def clear_gpu_cache(self):
+        for cache_key, cpu_weights, scale in prepared:
+            gpu_weights = self.gpu_cache.get(cache_key)
+            if gpu_weights is None:
+                while len(self.gpu_cache) >= max(1, self.capacity):
+                    self.gpu_cache.popitem(last=False)
+                gpu_weights = {
+                    m_name: (
+                        A.to(device=device, dtype=torch.bfloat16),
+                        B.to(device=device, dtype=torch.bfloat16),
+                    )
+                    for m_name, (A, B) in cpu_weights.items()
+                }
+                self.gpu_cache[cache_key] = gpu_weights
+            else:
+                self.gpu_cache.move_to_end(cache_key)
+
+            for m_name, (A_gpu, B_gpu) in gpu_weights.items():
+                target_mod = reg.get(m_name)
+                if target_mod is not None:
+                    target_mod.adapters.append((A_gpu, B_gpu, float(scale)))
+
+    def deactivate(self, transformer: nn.Module) -> None:
+        reg = self.registries.get(id(transformer))
+        if reg is None:
+            return
+        for mod in reg.values():
+            if hasattr(mod, "adapters") and isinstance(mod.adapters, list):
+                mod.adapters.clear()
+
+    def clear_gpu_cache(self) -> None:
         self.gpu_cache.clear()
 
 
 @torch.no_grad()
-def fuse_into_weights(transformer, specs):
-    modules = _linear_modules(transformer)
-    for item in specs:
-        spec = item if isinstance(item, LoraSpec) else LoraSpec.model_validate(item)
+def fuse_into_weights(transformer: nn.Module, specs: list[LoraSpec]) -> None:
+    if not specs:
+        return
+    linear_mods = {
+        name: mod
+        for name, mod in transformer.named_modules()
+        if isinstance(mod, nn.Linear) and mod.weight is not None
+    }
+    for raw_spec in specs:
+        spec = raw_spec if isinstance(raw_spec, LoraSpec) else LoraSpec.model_validate(raw_spec)
         path = resolve_lora(spec.source, spec.weight_name)
-        weights = parse_lora(path, modules)
-        for name, (a, b) in weights.items():
-            module = modules[name]
-            if not isinstance(module, nn.Linear) or module.weight is None:
-                raise ValueError("LoRAs must be fused before FP8 conversion")
-            if a.shape[1] != module.in_features or b.shape[0] != module.out_features:
-                raise ValueError(f"LoRA dimensions do not match {name}")
-            a = a.to(module.weight.device, dtype=torch.float32)
-            b = b.to(module.weight.device, dtype=torch.float32)
-            for start in range(0, module.out_features, 512):
-                stop = min(start + 512, module.out_features)
-                delta = b[start:stop] @ a
-                updated = module.weight[start:stop].float() + delta * spec.scale
-                module.weight[start:stop].copy_(updated.to(module.weight.dtype))
+        parsed = parse_lora(path, set(linear_mods.keys()))
+        for mod_name, (A, B) in parsed.items():
+            mod = linear_mods[mod_name]
+            w = mod.weight
+            A_dev = A.to(device=w.device, dtype=torch.float32)
+            B_dev = B.to(device=w.device, dtype=torch.float32)
+            delta = (B_dev @ A_dev) * float(spec.scale)
+            w.copy_((w.float() + delta).to(w.dtype))

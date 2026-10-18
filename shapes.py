@@ -3,7 +3,7 @@ import math
 
 FPS = 24
 
-RESOLUTIONS = {
+RESOLUTIONS: dict[str, dict[str, tuple[int, int]]] = {
     "480p": {
         "16:9": (832, 480),
         "9:16": (480, 832),
@@ -20,28 +20,23 @@ RESOLUTIONS = {
     },
 }
 
-NATIVE_MIN_FRAMES = 124
-NATIVE_MAX_FRAMES = 345
+NATIVE_MIN_N = 7
+NATIVE_MAX_N = 20
+NATIVE_MIN_FRAMES = 17 * NATIVE_MIN_N + 5
+NATIVE_MAX_FRAMES = 17 * NATIVE_MAX_N + 5
 
 
 def closest_aspect(w: int, h: int) -> str:
     if w <= 0 or h <= 0:
-        raise ValueError("Image dimensions must be positive")
+        raise ValueError("Width and height must be positive")
     target = math.log(w / h)
     return min(
-        RESOLUTIONS["768p"],
-        key=lambda key: abs(
-            target
-            - math.log(
-                int(key.split(":")[0]) / int(key.split(":")[1])
-            )
-        ),
-    )
+        RESOLUTIONS["768p"].items(),
+        key=lambda item: abs(target - math.log(item[1][0] / item[1][1])),
+    )[0]
 
 
 def frames_for_duration(seconds: float) -> int:
-    if not math.isfinite(seconds):
-        raise ValueError("Duration must be finite")
     return max(1, round(seconds * FPS))
 
 
@@ -49,23 +44,20 @@ def validate_num_frames(n: int) -> int:
     if isinstance(n, bool) or not isinstance(n, int):
         raise ValueError("num_frames must be an integer")
     if (n - 5) % 17 != 0 or (n - 5) // 17 < 1:
-        raise ValueError("num_frames must satisfy num_frames = 17*n + 5, n >= 1")
+        raise ValueError("num_frames must follow 17n + 5 with n >= 1")
     return n
-
-
-def _native_ceiling(value: int) -> int:
-    index = max(7, math.ceil((value - 5) / 17))
-    if index > 20:
-        raise ValueError("Requested segment exceeds the native frame range")
-    return 17 * index + 5
 
 
 def plan_segments(F: int) -> tuple[list[int], int]:
     if isinstance(F, bool) or not isinstance(F, int) or F < 1:
-        raise ValueError("The final frame count must be a positive integer")
-    if F <= NATIVE_MAX_FRAMES:
-        return [_native_ceiling(max(F, NATIVE_MIN_FRAMES))], F
-    count = math.ceil((F - 1) / 344)
-    minimum_length = 1 + math.ceil((F - 1) / count)
-    length = _native_ceiling(minimum_length)
-    return [length] * count, F
+        raise ValueError("Frame count F must be a positive integer")
+    if F <= 345:
+        target = max(F, 124)
+        n = max(7, math.ceil((target - 5) / 17))
+        return ([17 * n + 5], F)
+    k = math.ceil((F - 1) / 344)
+    for n in range(7, 21):
+        L = 17 * n + 5
+        if 1 + k * (L - 1) >= F:
+            return ([L] * k, F)
+    return ([345] * k, F)

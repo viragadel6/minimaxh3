@@ -1,78 +1,57 @@
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from shapes import validate_num_frames
 
 
-class StrictModel(BaseModel):
-    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+class MediaInput(BaseModel):
+    source: str
 
 
-class MediaInput(StrictModel):
-    source: str = Field(min_length=1)
-
-
-class ReferenceInput(StrictModel):
+class ReferenceInput(BaseModel):
     type: Literal["image", "video", "audio"]
-    source: str = Field(min_length=1)
+    source: str
     strength: float | None = None
-    start_seconds: float | None = Field(default=None, ge=0)
-    end_seconds: float | None = Field(default=None, gt=0)
-
-    @model_validator(mode="after")
-    def validate_interval(self):
-        if self.end_seconds is not None:
-            if self.end_seconds <= (self.start_seconds or 0.0):
-                raise ValueError("end_seconds must exceed start_seconds")
-        return self
+    start_seconds: float | None = None
+    end_seconds: float | None = None
 
 
-class LoraSpec(StrictModel):
-    source: str = Field(min_length=1)
+class LoraSpec(BaseModel):
+    source: str
     weight_name: str | None = None
     scale: float = 1.0
 
 
-class GenerationRequest(StrictModel):
-    prompt: str = Field(min_length=1)
+class GenerationRequest(BaseModel):
+    prompt: str
     mode: Literal["t2v", "i2v", "fl2v", "ref2v"] | None = None
     resolution: Literal["480p", "768p"] = "768p"
-    aspect_ratio: Literal[
-        "16:9", "9:16", "1:1", "4:3", "3:4", "auto"
-    ] = "16:9"
-    duration_seconds: float | None = Field(default=None, gt=0)
+    aspect_ratio: Literal["16:9", "9:16", "1:1", "4:3", "3:4", "auto"] = "16:9"
+    duration_seconds: float | None = None
     num_frames: int | None = None
     profile: Literal["quality", "fast", "turbo"] | None = None
-    num_inference_steps: int | None = Field(default=None, ge=1)
-    seed: int | None = Field(default=None, ge=0, le=2**63 - 1)
+    num_inference_steps: int | None = None
+    seed: int | None = None
     first_frame: MediaInput | None = None
     last_frame: MediaInput | None = None
     references: list[ReferenceInput] = Field(default_factory=list)
     loras: list[LoraSpec] = Field(default_factory=list)
     include_audio: bool = True
 
-    @field_validator("prompt")
-    @classmethod
-    def nonempty_prompt(cls, value):
-        if not value.strip():
-            raise ValueError("prompt must not be blank")
-        return value
-
-    @field_validator("num_frames")
-    @classmethod
-    def check_frame_grid(cls, value):
-        return None if value is None else validate_num_frames(value)
-
     @model_validator(mode="after")
-    def validate_request(self):
+    def _validate_and_resolve(self) -> "GenerationRequest":
+        if self.duration_seconds is not None and self.num_frames is not None:
+            raise ValueError("duration_seconds and num_frames cannot both be set")
         if self.duration_seconds is None and self.num_frames is None:
             self.duration_seconds = 5.0
-        elif self.duration_seconds is not None and self.num_frames is not None:
-            raise ValueError("Specify duration_seconds or num_frames, not both")
+        if self.duration_seconds is not None and self.duration_seconds <= 0:
+            raise ValueError("duration_seconds must be positive")
+        if self.num_frames is not None:
+            validate_num_frames(self.num_frames)
 
         if self.mode is None:
-            if self.references:
+            if len(self.references) > 0:
                 self.mode = "ref2v"
             elif self.first_frame is not None and self.last_frame is not None:
                 self.mode = "fl2v"
@@ -81,35 +60,42 @@ class GenerationRequest(StrictModel):
             else:
                 self.mode = "t2v"
 
-        if self.mode == "t2v":
-            if self.first_frame or self.last_frame or self.references:
-                raise ValueError("t2v does not accept conditioning media")
-        elif self.mode == "i2v":
+        if self.mode == "i2v":
             if self.first_frame is None:
-                raise ValueError("i2v requires first_frame")
-            if self.last_frame is not None or self.references:
-                raise ValueError("Use fl2v or ref2v for these additional conditions")
+                raise ValueError("mode 'i2v' requires first_frame")
+            if self.last_frame is not None or len(self.references) > 0:
+                raise ValueError("mode 'i2v' does not allow last_frame or references")
         elif self.mode == "fl2v":
             if self.first_frame is None or self.last_frame is None:
-                raise ValueError("fl2v requires first_frame and last_frame")
-            if self.references:
-                raise ValueError("fl2v does not accept references")
+                raise ValueError("mode 'fl2v' requires first_frame and last_frame")
+            if len(self.references) > 0:
+                raise ValueError("mode 'fl2v' does not allow references")
         elif self.mode == "ref2v":
-            if not self.references:
-                raise ValueError("ref2v requires at least one reference")
+            if len(self.references) == 0:
+                raise ValueError("mode 'ref2v' requires at least one reference")
             if self.last_frame is not None:
-                raise ValueError("ref2v does not accept last_frame")
+                raise ValueError("mode 'ref2v' requires last_frame to be unassigned")
+        elif self.mode == "t2v":
+            if (
+                self.first_frame is not None
+                or self.last_frame is not None
+                or len(self.references) > 0
+            ):
+                raise ValueError(
+                    "mode 't2v' requires first_frame, last_frame, and references to be unassigned"
+                )
 
         if self.aspect_ratio == "auto":
-            has_image = any(item.type == "image" for item in self.references)
-            if self.first_frame is None and not has_image:
+            has_image_ref = any(r.type == "image" for r in self.references)
+            if self.first_frame is None and not has_image_ref:
                 raise ValueError(
-                    "Automatic aspect ratio requires first_frame or an image reference"
+                    "aspect_ratio='auto' requires first_frame or an image reference"
                 )
+
         return self
 
 
-class ResolvedParams(StrictModel):
+class ResolvedParams(BaseModel):
     width: int
     height: int
     num_frames: int
@@ -122,7 +108,7 @@ class ResolvedParams(StrictModel):
     segments: list[int]
 
 
-class JobStatus(StrictModel):
+class JobStatus(BaseModel):
     id: str
     status: Literal["queued", "running", "succeeded", "failed"]
     created_at: str
@@ -132,12 +118,12 @@ class JobStatus(StrictModel):
     error: str | None = None
 
 
-class ErrorBody(StrictModel):
+class ErrorBody(BaseModel):
     error: dict[str, str]
 
     @field_validator("error")
     @classmethod
-    def require_error_fields(cls, value):
-        if not {"code", "message"}.issubset(value):
-            raise ValueError("error must contain code and message")
-        return value
+    def _validate_error_dict(cls, v: dict[str, str]) -> dict[str, str]:
+        if "code" not in v or "message" not in v:
+            raise ValueError("error must contain 'code' and 'message'")
+        return v

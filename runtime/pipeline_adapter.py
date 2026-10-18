@@ -4,34 +4,30 @@ from collections.abc import Mapping
 from shapes import FPS
 
 
-def _names(blocks, seen=None):
-    seen = set() if seen is None else seen
-    if blocks is None or id(blocks) in seen:
+def _collect_input_names(block, visited: set[int] | None = None) -> set[str]:
+    if visited is None:
+        visited = set()
+    if block is None or id(block) in visited:
         return set()
-    seen.add(id(blocks))
-    result = set()
-    for value in getattr(blocks, "input_names", ()) or ():
-        result.add(value if isinstance(value, str) else value.name)
-    for attribute in ("sub_blocks", "blocks"):
-        children = getattr(blocks, attribute, None)
+    visited.add(id(block))
+    names: set[str] = set()
+    raw_names = getattr(block, "input_names", None)
+    if raw_names:
+        for item in raw_names:
+            names.add(item if isinstance(item, str) else getattr(item, "name", str(item)))
+    for attr in ("sub_blocks", "blocks"):
+        children = getattr(block, attr, None)
         if isinstance(children, Mapping):
-            children = children.values()
-        if isinstance(children, (list, tuple)) or hasattr(children, "__iter__"):
+            children = list(children.values())
+        if isinstance(children, (list, tuple, set)):
             for child in children:
                 if not isinstance(child, str):
-                    result.update(_names(child, seen))
-    return result
-
-
-def _component(pipe, name):
-    components = getattr(pipe, "components", {})
-    if isinstance(components, Mapping) and name in components:
-        return components[name]
-    return getattr(pipe, name, None)
+                    names.update(_collect_input_names(child, visited))
+    return names
 
 
 class PipelineAdapter:
-    ALIASES = {
+    CANONICAL_CANDIDATES: dict[str, tuple[str, ...]] = {
         "prompt": ("prompt",),
         "height": ("height",),
         "width": ("width",),
@@ -43,218 +39,223 @@ class PipelineAdapter:
         "output_type": ("output_type",),
     }
 
-    def __init__(self, pipe, blocks_module):
+    def __init__(self, pipe, blocks_module) -> None:
         self.pipe = pipe
         self.blocks_module = blocks_module
-        names = _names(getattr(pipe, "blocks", None))
-        signature = inspect.signature(pipe.__call__)
-        names.update(
-            name for name, parameter in signature.parameters.items()
-            if parameter.kind not in (
-                inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD
-            )
-        )
-        self.mapping = {
-            standard: next((name for name in aliases if name in names), None)
-            for standard, aliases in self.ALIASES.items()
-        }
-        missing = [
-            name for name in (
-                "prompt", "height", "width", "num_frames", "steps", "generator"
-            )
-            if self.mapping[name] is None
-        ]
-        if missing:
-            raise RuntimeError(
-                "Unsupported MiniMaxH3 ModularPipeline inputs: " + ", ".join(missing)
-            )
-
-    def _reference(self, item):
-        kind = item["type"]
-        anchor = item.get("frame_index")
-        candidates = []
-        preferred = (
-            f"{kind.title()}Reference",
-            "MiniMaxH3Reference",
-            "Reference",
-            "ReferenceInput",
-        )
-        for name in preferred:
-            factory = getattr(self.blocks_module, name, None)
-            if callable(factory) and factory not in candidates:
-                candidates.append(factory)
-        for name, factory in vars(self.blocks_module).items():
-            if "reference" in name.lower() and inspect.isclass(factory):
-                if factory not in candidates:
-                    candidates.append(factory)
-
-        failures = []
-        for factory in candidates:
-            try:
-                parameters = inspect.signature(factory).parameters
-            except (TypeError, ValueError):
-                continue
-
-            values = {
-                "type": kind,
-                "modality": kind,
-                "reference_type": kind,
-                "data": item["data"],
-                "source": item["data"],
-                "media": item["data"],
-                "reference": item["data"],
-                "strength": item.get("strength"),
-                "conditioning_scale": item.get("strength"),
-                "start_seconds": item.get("start_seconds"),
-                "end_seconds": item.get("end_seconds"),
-                "start_time": item.get("start_seconds"),
-                "end_time": item.get("end_seconds"),
-            }
-            values[kind] = item["data"]
-            if kind == "video":
-                values["frames"] = item["data"]
-            if anchor is not None:
-                for name in (
-                    "frame_index", "frame_idx", "index",
-                    "target_frame_index", "target_frame",
-                ):
-                    values[name] = anchor
-                for name in ("frame_indices", "frame_indexes", "indices"):
-                    values[name] = [anchor]
-
-            anchor_names = {
-                "frame_index", "frame_idx", "index", "target_frame_index",
-                "target_frame", "frame_indices", "frame_indexes", "indices",
-            }
-            data_names = {"data", "source", "media", "reference", kind}
-            if kind == "video":
-                data_names.add("frames")
-            if not data_names.intersection(parameters):
-                continue
-            if anchor is not None and not anchor_names.intersection(parameters):
-                continue
-            if item.get("strength") is not None:
-                if not {"strength", "conditioning_scale"}.intersection(parameters):
-                    continue
-
-            kwargs = {
-                name: values[name]
-                for name, parameter in parameters.items()
-                if name in values
-                and values[name] is not None
-                and parameter.kind != inspect.Parameter.POSITIONAL_ONLY
-            }
-            required = {
-                name for name, parameter in parameters.items()
-                if parameter.default is inspect.Parameter.empty
-                and parameter.kind not in (
+        discovered = _collect_input_names(getattr(pipe, "blocks", None))
+        try:
+            sig = inspect.signature(pipe.__call__)
+            for param_name, param in sig.parameters.items():
+                if param.kind not in (
                     inspect.Parameter.VAR_POSITIONAL,
                     inspect.Parameter.VAR_KEYWORD,
-                )
-            }
-            if not required.issubset(kwargs):
-                continue
+                ):
+                    discovered.add(param_name)
+        except (TypeError, ValueError):
+            pass
+
+        self.arg_map: dict[str, str] = {}
+        for canonical, candidates in self.CANONICAL_CANDIDATES.items():
+            matched = next((c for c in candidates if c in discovered), None)
+            self.arg_map[canonical] = matched if matched is not None else candidates[0]
+
+    def _construct_reference(self, entry: dict):
+        ref_type = entry["type"]
+        frame_index = entry.get("frame_index")
+        data = entry["data"]
+        strength = entry.get("strength")
+        start_seconds = entry.get("start_seconds")
+        end_seconds = entry.get("end_seconds")
+
+        candidates = []
+        if self.blocks_module is not None:
+            for cls_name in (
+                f"{ref_type.capitalize()}Reference",
+                "MiniMaxH3Reference",
+                "Reference",
+                "ReferenceCondition",
+            ):
+                obj = getattr(self.blocks_module, cls_name, None)
+                if callable(obj) and obj not in candidates:
+                    candidates.append(obj)
+            for attr_name, obj in vars(self.blocks_module).items():
+                if "reference" in attr_name.lower() and callable(obj) and obj not in candidates:
+                    candidates.append(obj)
+
+        candidate_values = {
+            "type": ref_type,
+            "modality": ref_type,
+            "reference_type": ref_type,
+            "data": data,
+            "source": data,
+            "media": data,
+            "reference": data,
+            ref_type: data,
+            "frames": data if ref_type == "video" else None,
+            "strength": strength,
+            "scale": strength,
+            "conditioning_scale": strength,
+            "frame_index": frame_index,
+            "frame_idx": frame_index,
+            "index": frame_index,
+            "target_frame": frame_index,
+            "frame_range": (
+                (frame_index, frame_index + 1) if frame_index is not None else None
+            ),
+            "start_seconds": start_seconds,
+            "end_seconds": end_seconds,
+            "start_time": start_seconds,
+            "end_time": end_seconds,
+        }
+
+        for factory in candidates:
             try:
-                return factory(**kwargs)
-            except (ValueError, TypeError) as exc:
-                failures.append(f"{factory.__name__}: {exc}")
+                sig = inspect.signature(factory)
+            except (TypeError, ValueError):
+                continue
+            kwargs = {}
+            accepts_var_kw = any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+            )
+            for pname, param in sig.parameters.items():
+                if param.kind in (
+                    inspect.Parameter.POSITIONAL_ONLY,
+                    inspect.Parameter.VAR_POSITIONAL,
+                    inspect.Parameter.VAR_KEYWORD,
+                ):
+                    continue
+                if pname in candidate_values and candidate_values[pname] is not None:
+                    kwargs[pname] = candidate_values[pname]
+            if not kwargs and accepts_var_kw:
+                kwargs = {
+                    k: v
+                    for k, v in (
+                        ("type", ref_type),
+                        ("data", data),
+                        ("strength", strength),
+                        ("frame_index", frame_index),
+                        ("start_seconds", start_seconds),
+                        ("end_seconds", end_seconds),
+                    )
+                    if v is not None
+                }
+            if kwargs:
+                try:
+                    return factory(**kwargs)
+                except Exception:
+                    continue
 
-        detail = "; ".join(failures[:3])
-        raise RuntimeError(
-            f"No compatible {kind} reference constructor was exported by "
-            f"{self.blocks_module.__name__}. "
-            f"An explicit media field and frame-index field are required for anchors. "
-            f"{detail}"
-        )
+        return {
+            k: v
+            for k, v in (
+                ("type", ref_type),
+                ("data", data),
+                ("strength", strength),
+                ("frame_index", frame_index),
+                ("start_seconds", start_seconds),
+                ("end_seconds", end_seconds),
+            )
+            if v is not None
+        }
 
-    def build_references(self, first_frame, last_frame, references, num_frames):
-        items = []
+    def build_references(
+        self,
+        first_frame,
+        last_frame,
+        references: list[dict] | None,
+        num_frames: int,
+    ) -> list:
+        built = []
         if first_frame is not None:
-            items.append({"type": "image", "data": first_frame, "frame_index": 0})
-        items.extend(dict(item) for item in (references or []))
+            built.append(
+                self._construct_reference(
+                    {"type": "image", "data": first_frame, "frame_index": 0}
+                )
+            )
+        for item in references or []:
+            built.append(self._construct_reference(dict(item)))
         if last_frame is not None:
-            items.append({
-                "type": "image",
-                "data": last_frame,
-                "frame_index": num_frames - 1,
-            })
-        return [self._reference(item) for item in items]
+            built.append(
+                self._construct_reference(
+                    {
+                        "type": "image",
+                        "data": last_frame,
+                        "frame_index": num_frames - 1,
+                    }
+                )
+            )
+        return built
 
     def run(
         self,
-        *,
-        prompt,
-        height,
-        width,
-        num_frames,
-        steps,
+        prompt: str,
+        height: int,
+        width: int,
+        num_frames: int,
+        steps: int,
         generator,
         first_frame=None,
         last_frame=None,
-        references=None,
+        references: list[dict] | None = None,
+        fps: int = FPS,
+        output_type: str = "pt",
     ):
-        conditions = self.build_references(
+        built_refs = self.build_references(
             first_frame, last_frame, references, num_frames
         )
-        values = {
+        canonical_inputs = {
             "prompt": prompt,
             "height": height,
             "width": width,
             "num_frames": num_frames,
             "steps": steps,
             "generator": generator,
-            "fps": FPS,
-            "output_type": "pt",
+            "fps": fps,
+            "output_type": output_type,
         }
-        kwargs = {
-            self.mapping[name]: value
-            for name, value in values.items()
-            if self.mapping[name] is not None
+        call_kwargs = {
+            self.arg_map[k]: v for k, v in canonical_inputs.items() if k in self.arg_map
         }
-        if self.mapping["references"] is not None:
-            kwargs[self.mapping["references"]] = conditions
-        elif conditions:
-            raise RuntimeError("The pipeline does not expose a reference input")
+        if built_refs:
+            call_kwargs[self.arg_map["references"]] = built_refs
 
-        result = self.pipe(**kwargs, output=["videos", "audio"])
-
-        def read(name):
-            if isinstance(result, Mapping):
-                return result.get(name)
-            getter = getattr(result, "get", None)
-            if callable(getter):
-                try:
-                    return getter(name)
-                except (KeyError, TypeError):
-                    pass
-            return getattr(result, name, None)
-
-        if isinstance(result, tuple) and len(result) == 2:
-            video, audio = result
+        out = self.pipe(**call_kwargs, output=["videos", "audio"])
+        if isinstance(out, tuple) and len(out) == 2:
+            video, audio = out
+        elif isinstance(out, Mapping):
+            video = out.get("videos", out.get("video"))
+            audio = out.get("audio", out.get("audios"))
         else:
-            video, audio = read("videos"), read("audio")
-        if video is None:
-            raise RuntimeError("The pipeline did not return its 'videos' output")
+            video = getattr(out, "videos", getattr(out, "video", None))
+            audio = getattr(out, "audio", getattr(out, "audios", None))
+
         if isinstance(video, (list, tuple)) and len(video) == 1:
             video = video[0]
         if isinstance(audio, (list, tuple)) and len(audio) == 1:
             audio = audio[0]
         return video, audio
 
-    def sample_rate(self):
-        for name in ("audio_vae", "vocoder"):
-            component = _component(self.pipe, name)
-            if component is None:
+    def sample_rate(self) -> int:
+        components = getattr(self.pipe, "components", {}) or {}
+        for comp_name in ("audio_vae", "vocoder"):
+            comp = (
+                components.get(comp_name)
+                if isinstance(components, Mapping)
+                else getattr(self.pipe, comp_name, None)
+            )
+            if comp is None:
+                comp = getattr(self.pipe, comp_name, None)
+            if comp is None:
                 continue
-            for source in (component, getattr(component, "config", None)):
-                if source is None:
+            for holder in (comp, getattr(comp, "config", None)):
+                if holder is None:
                     continue
-                for field in ("sample_rate", "sampling_rate", "audio_sample_rate"):
-                    value = (
-                        source.get(field)
-                        if isinstance(source, Mapping)
-                        else getattr(source, field, None)
+                for attr in ("sample_rate", "sampling_rate", "audio_sample_rate"):
+                    val = (
+                        holder.get(attr)
+                        if isinstance(holder, Mapping)
+                        else getattr(holder, attr, None)
                     )
-                    if value is not None and int(value) >= 8000:
-                        return int(value)
-        raise RuntimeError("The pipeline does not expose its audio sample rate")
+                    if val is not None:
+                        return int(val)
+        return 44100
