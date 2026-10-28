@@ -358,3 +358,32 @@ def test_va_kernels_lazy_exports():
     assert package.routed_sdpa is not None
     with pytest.raises(AttributeError):
         package.not_a_real_export  # noqa: B018 - attribute probe
+
+
+# ---------------------------------------------------------------------------
+# warm-up bucket parsing
+# ---------------------------------------------------------------------------
+def test_warmup_buckets_parse_the_documented_format():
+    from runtime.model_manager import _parse_warmup_buckets
+
+    specs = _parse_warmup_buckets("768p:16:9:124,480p:9:16:243")
+    from shapes import RESOLUTIONS
+
+    assert specs == [
+        (*RESOLUTIONS["768p"]["16:9"], 124),
+        (*RESOLUTIONS["480p"]["9:16"], 243),
+    ]
+
+
+def test_warmup_buckets_skip_bad_entries_instead_of_raising():
+    from runtime.model_manager import _parse_warmup_buckets
+
+    for bad in ("garbage", "999p:16:9:124", "768p:16:9:abc", "768p:16:9", ""):
+        assert _parse_warmup_buckets(bad) == []
+
+
+def test_warmup_buckets_normalise_off_grid_frame_counts():
+    from runtime.model_manager import _parse_warmup_buckets
+
+    specs = _parse_warmup_buckets("768p:16:9:120")
+    assert specs and specs[0][2] % 17 == 5

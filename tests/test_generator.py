@@ -6,6 +6,7 @@ frame chaining between segments, audio plumbing and the encode step.
 """
 
 import asyncio
+import threading
 
 import numpy as np
 import pytest
@@ -54,15 +55,21 @@ class _FakeLoraManager:
         self.prepared = []
         self.activated = []
         self.deactivated = 0
+        self.threads = []
 
     def prepare(self, transformer, specs):
+        # LoRA preparation can move weights to the GPU, so it must happen on the
+        # single GPU worker thread.
+        self.threads.append(threading.current_thread().name)
         self.prepared.append(list(specs))
         return []
 
     def activate(self, transformer, prepared):
+        self.threads.append(threading.current_thread().name)
         self.activated.append(prepared)
 
     def deactivate(self, transformer):
+        self.threads.append(threading.current_thread().name)
         self.deactivated += 1
 
 
@@ -122,6 +129,15 @@ def generator(monkeypatch):
 
 def _run(coro):
     return asyncio.run(coro)
+
+
+def test_all_model_mutation_happens_on_the_gpu_thread(generator):
+    gen, manager, recorded = generator
+    _run(gen.run(GenerationRequest(prompt="hi", num_frames=124, seed=1)))
+    assert manager.lora_manager.threads, "LoRA lifecycle should have run"
+    assert all(name.startswith("va-gpu") for name in manager.lora_manager.threads), (
+        manager.lora_manager.threads
+    )
 
 
 def test_single_segment_run(generator):

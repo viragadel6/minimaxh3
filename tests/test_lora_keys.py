@@ -148,16 +148,24 @@ def test_alpha_base_rejects_weight_keys():
     assert lora_keys._alpha_base("blocks.0.attn.weight") is None
 
 
-def test_name_maps_detect_ambiguity():
+def test_name_maps_keep_exact_names_and_drop_ambiguous_redirects():
     exact, underscore = lora_keys._build_name_maps(
         ["a.b", "a_b", "unambiguous.one"]
     )
+    # Both modules are addressable by their literal name ...
     assert exact["a.b"] == "a.b"
-    # "a_b" is ambiguous (both a real module name and the underscore form of "a.b").
-    assert "a_b" not in exact
-    # Two modules collapse onto the same underscore form: neither may be inferred.
+    assert exact["a_b"] == "a_b"
+    # ... but "a_b" cannot be silently redirected to either of them, and an
+    # unrelated module still resolves through its underscore form.
     assert underscore.get("a_b") is None
     assert underscore["unambiguous_one"] == "unambiguous.one"
+
+
+def test_resolve_prefers_exact_name_over_underscore_redirect():
+    exact, underscore = lora_keys._build_name_maps(["a.b", "a_b"])
+    # A key that literally names a module wins over the ambiguous underscore form.
+    assert lora_keys._resolve_module_name("a_b", exact, underscore) == "a_b"
+    assert lora_keys._resolve_module_name("a.b", exact, underscore) == "a.b"
 
 
 def test_resolve_module_name_prefers_exact():

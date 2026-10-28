@@ -30,6 +30,7 @@ from pydantic import (
 
 from shapes import (
     MAX_SEGMENT_FRAMES,
+    NATIVE_MIN_FRAMES,
     NATIVE_MIN_N,
     frames_for_duration,
     normalize_num_frames,
@@ -158,6 +159,16 @@ class GenerationRequest(_StrictModel):
                 raise ValueError("duration_seconds must be a positive finite number")
         if self.num_frames is not None:
             validate_num_frames(self.num_frames)
+            if self.num_frames < NATIVE_MIN_FRAMES:
+                # A shorter clip still costs one full native segment to render, so
+                # accepting it would silently burn ~5x the GPU time the caller asked
+                # for. Durations are rounded up instead of rejected.
+                raise ValueError(
+                    f"num_frames={self.num_frames} is below the minimum native "
+                    f"length of {NATIVE_MIN_FRAMES} frames "
+                    f"(17*{NATIVE_MIN_N}+5); pass duration_seconds to round up "
+                    "automatically"
+                )
         if self.aspect_ratio == "auto" and self.aspect_source() is None:
             raise ValueError(
                 "aspect_ratio='auto' requires first_frame, last_frame or an "

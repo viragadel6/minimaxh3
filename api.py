@@ -22,7 +22,7 @@ import os
 import tempfile
 import threading
 import uuid
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Mapping
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -100,6 +100,29 @@ def _code_for_status(status_code: int) -> str:
 # ---------------------------------------------------------------------------
 # small helpers
 # ---------------------------------------------------------------------------
+def _message_text(message: Any) -> str:
+    """Flatten an exception detail into one human readable line.
+
+    Starlette passes ``detail`` through verbatim, and a handler that raises
+    ``HTTPException(400, {"detail": ...})`` would otherwise be rendered as a Python
+    dict repr inside the error message.
+    """
+    if message is None:
+        return ""
+    if isinstance(message, str):
+        return message.strip()
+    if isinstance(message, Mapping):
+        for key in ("message", "detail", "error", "msg", "reason"):
+            if key in message:
+                nested = _message_text(message[key])
+                if nested:
+                    return nested
+        return ", ".join(f"{k}: {_message_text(v)}" for k, v in message.items()).strip()
+    if isinstance(message, (list, tuple)):
+        return "; ".join(text for text in (_message_text(m) for m in message) if text)
+    return str(message).strip()
+
+
 def _error_response(
     status_code: int,
     code: str | None,
@@ -107,8 +130,8 @@ def _error_response(
     headers: dict[str, str] | None = None,
 ) -> JSONResponse:
     """Render an error body, degrading gracefully if the payload cannot be modelled."""
-    text = str(message) if message is not None else ""
-    if not text.strip():
+    text = _message_text(message)
+    if not text:
         text = _code_for_status(status_code).replace("_", " ")
     try:
         body = ErrorBody(
@@ -212,13 +235,41 @@ class _StreamTracker:
         with self._lock:
             return self._count
 
-    def enter(self) -> None:
+    def acquire(self, handle) -> "_StreamLease":
         with self._lock:
             self._count += 1
+        return _StreamLease(self, handle)
 
-    def exit(self) -> None:
+    def release(self) -> None:
         with self._lock:
             self._count = max(0, self._count - 1)
+
+
+class _StreamLease:
+    """Closes a file handle and releases a stream slot exactly once.
+
+    The slot is released both by the response body's ``finally`` and by a response
+    background task: a client that disconnects before the first chunk, or an error
+    while building the response, would otherwise leave the counter permanently
+    elevated - which silently disables volume reloads for the whole container.
+    """
+
+    def __init__(self, tracker: _StreamTracker, handle) -> None:
+        self._tracker = tracker
+        self._handle = handle
+        self._released = False
+        self._lock = threading.Lock()
+
+    def release(self) -> None:
+        with self._lock:
+            if self._released:
+                return
+            self._released = True
+            handle, self._handle = self._handle, None
+        try:
+            _close_quietly(handle)
+        finally:
+            self._tracker.release()
 
 
 # ---------------------------------------------------------------------------
@@ -331,22 +382,36 @@ def create_api(generator_cls, job_store, settings, outputs_volume) -> FastAPI:
         except ValidationError as exc:
             raise ApiError(500, "corrupt_record", "job record is inconsistent") from exc
 
-    async def _cancel_call(call_id: Any) -> None:
-        if not call_id:
+    async def _cancel_call(target: Any) -> None:
+        """Cancel a Modal call given either the object or its id."""
+        if not target:
             return
         try:
-            call = await _call_maybe_async(modal.FunctionCall.from_id, str(call_id))
+            call = target
+            if isinstance(target, (str, int)):
+                call = await _call_maybe_async(modal.FunctionCall.from_id, str(target))
             cancel = getattr(call, "cancel", None)
             if callable(cancel):
                 await _call_maybe_async(cancel)
         except Exception:
-            logger.warning("failed to cancel Modal call %s", call_id, exc_info=True)
+            logger.warning("failed to cancel Modal call %s", target, exc_info=True)
 
     def _describe(exc: BaseException) -> str:
         name = type(exc).__name__
         text = str(exc).strip().splitlines()
         detail = text[0][:400] if text else ""
         return f"{name}: {detail}" if detail else name
+
+    async def _count_poll_failure(job_id: str, record: dict) -> dict:
+        """Record one transient poll failure, failing the job once the budget is spent."""
+        failures = poll_failures.get(job_id, 0) + 1
+        poll_failures[job_id] = failures
+        if failures < int(settings.POLL_MAX_TRANSIENT_FAILURES):
+            return record
+        logger.warning("job %s lost its worker call after %d polls", job_id, failures)
+        await job_store.mark_failed(job_id, "the generation was lost")
+        poll_failures.pop(job_id, None)
+        return await job_store.get(job_id) or record
 
     async def _sync_job(job_id: str) -> dict:
         """Refresh a non-terminal job from its Modal call, then return the record."""
@@ -372,22 +437,24 @@ def create_api(generator_cls, job_store, settings, outputs_volume) -> FastAPI:
         call_id = record["call_id"]
         try:
             call = await _call_maybe_async(modal.FunctionCall.from_id, str(call_id))
+        except Exception:
+            # The control plane is unreachable or the call is not visible yet. That
+            # says nothing about the render, so count it as transient instead of
+            # failing a job that is still running healthily.
+            logger.warning("cannot resolve call %s for job %s", call_id, job_id, exc_info=True)
+            return await _count_poll_failure(job_id, record)
+
+        try:
             outcome = await _call_maybe_async(
                 call.get, timeout=float(settings.POLL_TIMEOUT_SECONDS)
             )
         except (asyncio.TimeoutError, TimeoutError):
-            # Modal's ``get`` raises TimeoutError while the call is still running.  A
+            # Modal's ``get`` raises TimeoutError while the call is still running. A
             # worker that genuinely raises TimeoutError is retried too, but the counter
             # guarantees the job reaches a terminal state instead of hanging forever.
-            failures = poll_failures.get(job_id, 0) + 1
-            poll_failures[job_id] = failures
-            if failures >= int(settings.POLL_MAX_TRANSIENT_FAILURES):
-                logger.warning("job %s lost its worker call after %d polls", job_id, failures)
-                await job_store.mark_failed(job_id, "the generation was lost")
-                poll_failures.pop(job_id, None)
-                return await job_store.get(job_id) or record
-            return record
+            return await _count_poll_failure(job_id, record)
         except Exception as exc:
+            # ``get`` re-raises the worker's own exception: the job really did fail.
             logger.exception("job %s failed in the worker", job_id)
             await job_store.mark_failed(job_id, f"generation failed ({_describe(exc)})")
             poll_failures.pop(job_id, None)
@@ -541,13 +608,25 @@ def create_api(generator_cls, job_store, settings, outputs_volume) -> FastAPI:
     )
     async def generate_sync(req: GenerationRequest):
         prepared = _prepare_request(req)
+        # ``remote()`` cannot be cancelled: a timeout would leave the worker rendering
+        # for a caller that has already gone away. Spawning first gives us a handle to
+        # cancel, so an abandoned request releases the GPU.
+        try:
+            call = await _call_maybe_async(
+                generator().generate_bytes.spawn, prepared.model_dump_json()
+            )
+        except Exception as exc:
+            logger.exception("synchronous generation could not be started")
+            raise ApiError(
+                502, "upstream_error", f"the generation failed ({_describe(exc)})"
+            ) from exc
+
         try:
             result = await _call_maybe_async(
-                generator().generate_bytes.remote,
-                prepared.model_dump_json(),
-                timeout=float(settings.SYNC_REQUEST_TIMEOUT),
+                call.get, timeout=float(settings.SYNC_REQUEST_TIMEOUT)
             )
-        except asyncio.TimeoutError as exc:
+        except (asyncio.TimeoutError, TimeoutError) as exc:
+            await _cancel_call(call)
             raise ApiError(504, "upstream_timeout", "the generation timed out") from exc
         except (ValidationError, ValueError):
             raise
@@ -675,24 +754,26 @@ def create_api(generator_cls, job_store, settings, outputs_volume) -> FastAPI:
             except (FileNotFoundError, IsADirectoryError):
                 raise ApiError(404, "not_found", "the video file is missing") from None
 
-        streams.enter()
+        lease = streams.acquire(handle)
 
         async def _body() -> AsyncIterator[bytes]:
             try:
                 async for chunk in _iter_file(handle):
                     yield chunk
             finally:
-                try:
-                    await asyncio.to_thread(_close_quietly, handle)
-                finally:
-                    streams.exit()
+                await asyncio.to_thread(lease.release)
 
         headers = {
             "Content-Length": str(size),
             "Content-Disposition": f'attachment; filename="{job_id}.mp4"',
             "Cache-Control": "private, max-age=3600",
         }
-        return StreamingResponse(_body(), media_type="video/mp4", headers=headers)
+        return StreamingResponse(
+            _body(),
+            media_type="video/mp4",
+            headers=headers,
+            background=BackgroundTask(lease.release),
+        )
 
     @api.delete(
         "/v1/generations/{id}",

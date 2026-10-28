@@ -232,28 +232,37 @@ def _alpha_base(key: str) -> str | None:
 
 
 def _build_name_maps(name_list: Sequence[str]) -> tuple[dict[str, str], dict[str, str]]:
+    """Build ``(exact, underscore)`` lookup maps for module names.
+
+    The two maps track ambiguity *independently*: when two modules collapse onto the
+    same underscore form (``a.b`` and ``a_b``) the underscore entry is dropped, but
+    the literal module name stays resolvable in the exact map.  Deduplicating through
+    a single set used to delete the exact entry as well, which made a legitimate
+    kohya key naming a real module fail with "unknown module".
+    """
     exact: dict[str, str] = {}
     underscore: dict[str, str] = {}
-    ambiguous: set[str] = set()
+    ambiguous_exact: set[str] = set()
+    ambiguous_underscore: set[str] = set()
     for mod_name in name_list:
         stripped = _strip_prefixes(mod_name)
         for alias in (mod_name, stripped):
             existing = exact.get(alias)
             if existing is not None and existing != mod_name:
-                ambiguous.add(alias)
+                ambiguous_exact.add(alias)
             exact[alias] = mod_name
-        forms = {
+        for form in {
             stripped.replace(".", "_"),
             f"lora_unet_{stripped.replace('.', '_')}",
             f"lora_transformer_{stripped.replace('.', '_')}",
-        }
-        for form in forms:
+        }:
             existing = underscore.get(form)
             if existing is not None and existing != mod_name:
-                ambiguous.add(form)
+                ambiguous_underscore.add(form)
             underscore[form] = mod_name
-    for alias in ambiguous:
+    for alias in ambiguous_exact:
         exact.pop(alias, None)
+    for alias in ambiguous_underscore:
         underscore.pop(alias, None)
     return exact, underscore
 

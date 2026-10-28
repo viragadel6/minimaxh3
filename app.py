@@ -16,6 +16,7 @@ import asyncio
 import base64
 import contextlib
 import json
+import logging
 import mimetypes
 import os
 import shutil
@@ -28,6 +29,8 @@ import modal
 from config import load_settings, settings_env
 
 settings = load_settings()
+
+logger = logging.getLogger(__name__)
 
 app = modal.App(settings.APP_NAME)
 
@@ -91,38 +94,71 @@ api_image = (
 # volume helpers
 # ---------------------------------------------------------------------------
 @contextlib.contextmanager
-def _volume_lock(name: str, timeout: float = 1800.0):
-    """Cross-container exclusive lock backed by the shared models volume."""
-    try:
-        import fcntl
-    except ImportError:  # pragma: no cover - non POSIX hosts
-        yield
-        return
-    lock_path = Path(settings.MODELS_DIR) / f".{name}.lock"
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    handle = lock_path.open("w")
+def _volume_lock(name: str, timeout: float = 1800.0, stale_after: float = 7200.0):
+    """Cross-container exclusive lock backed by the shared models volume.
+
+    Implemented with an atomic ``mkdir`` rather than ``fcntl.flock``: Modal volumes are
+    a network filesystem where advisory locks are unsupported (or silently local), so a
+    flock can look successful in every container at once.  ``mkdir`` is atomic on any
+    POSIX filesystem, and a lock left behind by a crashed container is reclaimed once
+    its owner file is older than ``stale_after``.  Reclaiming is safe because every
+    download is idempotent and publishes its marker only after success.
+    """
+    root = Path(settings.MODELS_DIR)
+    lock_dir = root / f".{name}.lock.d"
+    owner_file = lock_dir / "owner"
     deadline = time.monotonic() + timeout
-    try:
-        while True:
+    acquired = False
+    root.mkdir(parents=True, exist_ok=True)
+    while not acquired:
+        try:
+            lock_dir.mkdir()
+            acquired = True
+        except FileExistsError:
             try:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except BlockingIOError:
-                if time.monotonic() > deadline:
-                    raise TimeoutError(
-                        f"timed out waiting for the {name} volume lock"
-                    ) from None
-                time.sleep(1.0)
+                age = time.time() - lock_dir.stat().st_mtime
+            except FileNotFoundError:
+                continue  # released between mkdir() and stat()
+            if age > stale_after:
+                logger.warning("reclaiming stale %r volume lock (age %.0fs)", name, age)
+                with contextlib.suppress(OSError):
+                    (lock_dir / "owner").unlink(missing_ok=True)
+                    lock_dir.rmdir()
+                continue
+            if time.monotonic() > deadline:
+                raise TimeoutError(
+                    f"timed out waiting for the {name} volume lock"
+                ) from None
+            time.sleep(2.0)
+        except OSError as exc:  # pragma: no cover - volume without write access
+            logger.warning("cannot create the %r volume lock (%s); continuing", name, exc)
+            yield
+            return
+    try:
+        with contextlib.suppress(OSError):
+            owner_file.write_text(
+                f"{os.getpid()} {time.time():.0f}", encoding="utf-8"
+            )
         yield
     finally:
-        with contextlib.suppress(Exception):
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        handle.close()
+        with contextlib.suppress(OSError):
+            owner_file.unlink(missing_ok=True)
+            lock_dir.rmdir()
 
 
 def _commit_volume(volume) -> None:
     if volume is not None and hasattr(volume, "commit"):
         volume.commit()
+
+
+def _failure_reason(exc: BaseException) -> str:
+    """One-line, sanitised failure description safe to store and return to clients."""
+    if isinstance(exc, asyncio.CancelledError):
+        return "the generation was cancelled"
+    name = type(exc).__name__
+    lines = str(exc).strip().splitlines()
+    detail = lines[0][:300] if lines else ""
+    return f"generation failed ({name}: {detail})" if detail else f"generation failed ({name})"
 
 
 def _prune_outputs() -> int:
@@ -211,6 +247,9 @@ class VideoAudioGenerator:
         def _publish_sync() -> None:
             final.parent.mkdir(parents=True, exist_ok=True)
             os.replace(staged, final)
+            # Drop the per-job staging directory: leaving one empty directory per
+            # render behind leaks an inode (and a dentry) for the container's life.
+            shutil.rmtree(staged.parent, ignore_errors=True)
             # Rendering happened outside the volume, so a commit can only ever see
             # finished files - never another request's partial render.
             _commit_volume(outputs_volume)
@@ -221,7 +260,9 @@ class VideoAudioGenerator:
         async with self._publish_lock:
             await loop.run_in_executor(None, _publish_sync)
 
-    async def _cleanup(self, job_id: str, staging: Path, final: Path) -> None:
+    async def _cleanup(
+        self, job_id: str, staging: Path, final: Path, reason: str = "generation failed"
+    ) -> None:
         loop = asyncio.get_running_loop()
 
         def _unlink_all() -> None:
@@ -235,7 +276,9 @@ class VideoAudioGenerator:
         with contextlib.suppress(Exception):
             await loop.run_in_executor(None, _unlink_all)
         with contextlib.suppress(Exception):
-            await self.job_store.mark_failed(job_id, "generation failed")
+            # Record the real cause: the API treats a terminal record as authoritative
+            # and would otherwise only ever report a generic message.
+            await self.job_store.mark_failed(job_id, reason)
 
     # -- methods ---------------------------------------------------------
     @modal.method()
@@ -259,8 +302,9 @@ class VideoAudioGenerator:
             # on the polling side so a corrupted result can never be reported.
             return {"params": params.model_dump(), "video_path": str(final_path)}
         except BaseException as exc:  # includes CancelledError / worker timeouts
-            await self._cleanup(job_id, staged_path, final_path)
-            raise exc
+            await self._cleanup(job_id, staged_path, final_path, _failure_reason(exc))
+            # Bare ``raise``: keeps the original traceback for Modal's logs.
+            raise
 
     @modal.method()
     async def generate_bytes(self, request_json: str):

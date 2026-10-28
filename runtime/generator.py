@@ -242,6 +242,9 @@ class Generator:
         pipe_key: str,
         prefetched: dict[str, asyncio.Task] | None = None,
     ) -> dict:
+        # ``include_audio`` only controls whether audio is *returned*; an audio
+        # reference is still conditioning input, so it has to be decoded even when the
+        # caller asked for a silent result.
         needs_audio = req.include_audio or any(r.type == "audio" for r in req.references)
         loop = asyncio.get_running_loop()
         sample_rate = await loop.run_in_executor(
@@ -516,8 +519,13 @@ class Generator:
         media_task = asyncio.ensure_future(
             self.prepare_media(req, params, pipe_key, prefetched)
         )
+        # LoRA preparation can move tensors onto the GPU, so it must run on the GPU
+        # thread: ``asyncio.to_thread`` would put CUDA work on a second thread and
+        # break the single-GPU-thread invariant the executors are built around.
         lora_task = asyncio.ensure_future(
-            asyncio.to_thread(self._prepare_loras, transformer, req.loras)
+            loop.run_in_executor(
+                self.gpu_executor, partial(self._prepare_loras, transformer, req.loras)
+            )
         )
         try:
             media, prepared_loras = await asyncio.gather(media_task, lora_task)

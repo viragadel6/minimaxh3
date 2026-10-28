@@ -16,6 +16,8 @@ from fastapi.testclient import TestClient
 # doubles
 # ---------------------------------------------------------------------------
 class _FakeCall:
+    """Stand-in for ``modal.FunctionCall`` (job polling and sync renders)."""
+
     def __init__(self, payload=None, error=None, pending=0):
         self.payload = payload
         self.error = error
@@ -40,33 +42,32 @@ class _FakeHandle:
 
 
 class _FakeRemote:
-    def __init__(self, calls, name):
+    """Stand-in for a Modal method handle: ``spawn`` returns a call object."""
+
+    def __init__(self, calls, mode, control=None):
         self._calls = calls
-        self._name = name
+        self._mode = mode
+        self._control = control if control is not None else {}
 
-    def spawn(self, request_json, job_id):
-        return _FakeHandle("call-1")
-
-    def remote(self, request_json, timeout=None):
-        return self._calls.pop(0)
-
-
-class _FakeGenerator:
-    def __init__(self, sync_results=(), call=None):
-        self.sync_results = list(sync_results)
-        self.call = call
-
-    def generate(self):
-        raise AssertionError("generate must not be called directly")
-
-    def generate_bytes(self):
-        raise AssertionError("generate_bytes must not be called directly")
+    def spawn(self, request_json, job_id=None):
+        if self._mode == "job":
+            return _FakeHandle("call-1")
+        # A synchronous render is spawned too, so a timeout can cancel it.
+        if self._control.get("sync_error") is not None:
+            call = _FakeCall(error=self._control["sync_error"])
+        else:
+            payload = self._calls.pop(0) if self._calls else None
+            call = _FakeCall(
+                payload=payload, pending=int(self._control.get("sync_pending", 0))
+            )
+        self._control["last_sync_call"] = call
+        return call
 
 
 class _FakeGeneratorHandle:
-    def __init__(self, sync_results=()):
-        self.generate = _FakeRemote(list(sync_results), "sync")
-        self.generate_bytes = _FakeRemote(list(sync_results), "bytes")
+    def __init__(self, sync_results, control):
+        self.generate = _FakeRemote([], "job", control)
+        self.generate_bytes = _FakeRemote(sync_results, "bytes", control)
 
 
 class _FakeVolume:
@@ -110,11 +111,12 @@ def _build_env(root, monkeypatch, **overrides):
 
     class Facade:
         def __init__(self):
+            self.control = {}
             self.call = _FakeCall(payload={"params": _params_dict(), "video_path": None})
             self.sync_results = []
 
         def __call__(self):
-            return _FakeGeneratorHandle(self.sync_results)
+            return _FakeGeneratorHandle(self.sync_results, self.control)
 
     facade = Facade()
 
@@ -271,6 +273,29 @@ def test_expired_job_without_call_id_is_failed(api_env):
     assert "timed out" in response.json()["error"]
 
 
+def test_control_plane_error_is_transient_and_does_not_fail_the_job(api_env, monkeypatch):
+    client = api_env["client"]
+    job = _create_job(client).json()
+
+    class BrokenLookup:
+        @classmethod
+        def from_id(cls, call_id):
+            raise ConnectionError("modal control plane unavailable")
+
+    monkeypatch.setattr(modal, "FunctionCall", BrokenLookup, raising=False)
+    response = client.get(f"/v1/generations/{job['id']}")
+    body = response.json()
+    # A lookup failure says nothing about the render: the job stays non-terminal.
+    assert body["status"] in ("queued", "running")
+    assert body["error"] is None
+
+    # ... but the retry budget still bounds it, so it cannot hang forever.
+    for _ in range(api_env["settings"].POLL_MAX_TRANSIENT_FAILURES):
+        response = client.get(f"/v1/generations/{job['id']}")
+    assert response.json()["status"] == "failed"
+    assert "lost" in response.json()["error"]
+
+
 def test_worker_exception_fails_the_job(api_env):
     job = _create_job(api_env["client"]).json()
     api_env["facade"].call.error = RuntimeError("boom\nsecret traceback")
@@ -392,12 +417,30 @@ def test_sync_returns_video(api_env):
     assert response.headers["content-type"] == "video/mp4"
 
 
+def test_sync_timeout_cancels_the_remote_call(env_factory):
+    env = env_factory(SYNC_REQUEST_TIMEOUT=0.01)
+    env["facade"].control["sync_pending"] = 10**6  # never becomes ready
+    response = env["client"].post("/v1/generations/sync", json={"prompt": "hi"})
+    assert response.status_code == 504
+    assert response.json()["error"]["code"] == "upstream_timeout"
+    # The abandoned render must not keep the GPU busy for a caller that gave up.
+    assert env["facade"].control["last_sync_call"].cancelled is True
+
+
 def test_sync_rejects_oversized_payload(env_factory):
     env = env_factory(MAX_SYNC_BYTES=5)
     env["facade"].sync_results.append((b"x" * 10, _params_dict()))
     response = env["client"].post("/v1/generations/sync", json={"prompt": "hi"})
     assert response.status_code == 413
     assert response.json()["error"]["code"] == "payload_too_large"
+
+
+def test_sync_worker_error_is_a_502(env_factory):
+    env = env_factory()
+    env["facade"].control["sync_error"] = RuntimeError("cuda oom")
+    response = env["client"].post("/v1/generations/sync", json={"prompt": "hi"})
+    assert response.status_code == 502
+    assert "cuda oom" in response.json()["error"]["message"]
 
 
 def test_sync_invalid_worker_payload(api_env):
@@ -466,3 +509,46 @@ def test_generation_request_profile_writeback_is_serialised():
     req = GenerationRequest(prompt="hi")
     updated = req.model_copy(update={"profile": "fast"})
     assert json.loads(updated.model_dump_json())["profile"] == "fast"
+
+
+# ---------------------------------------------------------------------------
+# streaming lease
+# ---------------------------------------------------------------------------
+def test_stream_lease_releases_exactly_once():
+    from api import _StreamLease, _StreamTracker
+
+    class Handle:
+        def __init__(self):
+            self.closes = 0
+
+        def close(self):
+            self.closes += 1
+
+    tracker = _StreamTracker()
+    handle = Handle()
+    lease = _StreamLease(tracker, handle)
+    tracker.release = tracker.release  # sanity: bound method
+    tracker._count = 1
+    lease.release()
+    lease.release()
+    assert tracker.active == 0
+    assert handle.closes == 1
+
+
+def test_stream_tracker_never_goes_negative():
+    from api import _StreamTracker
+
+    tracker = _StreamTracker()
+    tracker.release()
+    tracker.release()
+    assert tracker.active == 0
+
+
+def test_error_message_flattens_structured_details():
+    from api import _error_response
+
+    structured = json.loads(_error_response(400, "invalid_request", {"detail": "bad seed"}).body)
+    assert structured["error"]["message"] == "bad seed"
+
+    nested = json.loads(_error_response(500, None, "").body)
+    assert nested["error"]["message"] == "internal error"

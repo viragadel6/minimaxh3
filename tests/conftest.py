@@ -12,8 +12,6 @@ import sys
 import types
 from pathlib import Path
 
-import pytest
-
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -162,9 +160,3 @@ def _find_torch() -> bool:
 
 
 HAS_TORCH = _find_torch()
-requires_torch = pytest.mark.skipif(not HAS_TORCH, reason="torch is not installed")
-
-
-@pytest.fixture
-def anyio_backend():
-    return "asyncio"

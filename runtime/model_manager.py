@@ -19,7 +19,7 @@ from runtime.lora import LoraManager, fuse_into_weights, parse_fused_loras
 from runtime.pipeline_adapter import PipelineAdapter
 from runtime.step_cache import StepResidualCache
 from runtime.weights import ensure_weights
-from shapes import RESOLUTIONS, validate_num_frames
+from shapes import RESOLUTIONS, normalize_num_frames, validate_num_frames
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +60,50 @@ def _get_components(pipe) -> dict:
     if isinstance(comps, Mapping):
         return dict(comps)
     return {}
+
+
+def _parse_warmup_buckets(raw: str) -> list[tuple[int, int, int]]:
+    """Parse ``WARMUP_BUCKETS`` into ``(width, height, frames)`` triples.
+
+    Malformed entries are skipped with a warning: this is an optional tuning knob, so a
+    typo must never prevent the container from starting.
+    """
+    bucket_specs: list[tuple[int, int, int]] = []
+    for entry in (raw or "").split(","):
+        item = entry.strip()
+        if not item:
+            continue
+        parts = item.split(":")
+        if len(parts) != 4:
+            logger.warning("ignoring warm-up bucket %r (expected RES:W:H:FRAMES)", item)
+            continue
+        res_key, ar_w, ar_h, f_str = parts
+        aspect = f"{ar_w}:{ar_h}"
+        size = RESOLUTIONS.get(res_key, {}).get(aspect)
+        if size is None:
+            logger.warning("ignoring warm-up bucket %r (unknown resolution/aspect)", item)
+            continue
+        try:
+            requested = int(f_str)
+        except ValueError:
+            logger.warning("ignoring warm-up bucket %r (frames is not a number)", item)
+            continue
+        try:
+            frames = validate_num_frames(requested)
+        except ValueError:
+            try:
+                frames = normalize_num_frames(requested)
+            except ValueError:
+                logger.warning("ignoring warm-up bucket %r (invalid frame count)", item)
+                continue
+            logger.info(
+                "warm-up bucket %r uses %d frames instead of %d",
+                item,
+                frames,
+                requested,
+            )
+        bucket_specs.append((int(size[0]), int(size[1]), int(frames)))
+    return bucket_specs
 
 
 class ModelManager:
@@ -295,19 +339,10 @@ class ModelManager:
     def _run_warmups(self) -> None:
         if self.settings.WARMUP_STEPS <= 0 or not self.settings.WARMUP_BUCKETS.strip():
             return
-        bucket_specs = []
-        for entry in self.settings.WARMUP_BUCKETS.split(","):
-            item = entry.strip()
-            if not item:
-                continue
-            parts = item.split(":")
-            if len(parts) != 4:
-                continue
-            res_key, ar_w, ar_h, f_str = parts
-            aspect = f"{ar_w}:{ar_h}"
-            width, height = RESOLUTIONS[res_key][aspect]
-            frames = validate_num_frames(int(f_str))
-            bucket_specs.append((width, height, frames))
+        bucket_specs = _parse_warmup_buckets(self.settings.WARMUP_BUCKETS)
+        if not bucket_specs:
+            logger.warning("no usable WARMUP_BUCKETS entry; skipping warm-up")
+            return
 
         for key in list(self.transformers.keys()):
             adapter = self.ensure_resident(key)

@@ -74,6 +74,20 @@ def test_num_frames_must_follow_grid():
         GenerationRequest(prompt="hi", num_frames=100)
 
 
+def test_num_frames_below_the_native_minimum_is_rejected():
+    # 22 is on the 17n+5 grid but far below one native segment: rendering it would
+    # cost a full 124-frame segment, so it must fail fast instead of silently
+    # over-rendering.
+    with pytest.raises(ValidationError) as excinfo:
+        GenerationRequest(prompt="hi", num_frames=22)
+    assert "minimum native" in str(excinfo.value)
+
+
+def test_short_durations_are_rounded_up_to_one_native_segment():
+    req = GenerationRequest(prompt="hi", duration_seconds=0.5)
+    assert req.effective_num_frames(24) >= 124
+
+
 def test_steps_and_seed_bounds():
     with pytest.raises(ValidationError):
         GenerationRequest(prompt="hi", num_inference_steps=0)
