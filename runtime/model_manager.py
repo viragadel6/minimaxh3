@@ -1,5 +1,6 @@
 import copy
 import gc
+import logging
 import importlib
 import inspect
 import os
@@ -11,14 +12,16 @@ import torch
 import torch.nn as nn
 from PIL import Image
 
-from kernels import attention_router
-from kernels.attention_router import denoiser_scope, instrument_transformer
-from kernels.fp8_linear import convert_transformer_to_fp8, find_primary_block_list
+from va_kernels import attention_router
+from va_kernels.attention_router import denoiser_scope, instrument_transformer
+from va_kernels.fp8_linear import convert_transformer_to_fp8, find_primary_block_list
 from runtime.lora import LoraManager, fuse_into_weights, parse_fused_loras
 from runtime.pipeline_adapter import PipelineAdapter
 from runtime.step_cache import StepResidualCache
 from runtime.weights import ensure_weights
 from shapes import RESOLUTIONS, validate_num_frames
+
+logger = logging.getLogger(__name__)
 
 
 def _module_footprint_bytes(mod: nn.Module) -> int:
@@ -110,35 +113,52 @@ class ModelManager:
             fuse_into_weights(transformer, fused_specs)
 
         if self.settings.WEIGHT_PRECISION == "fp8":
-            convert_transformer_to_fp8(
+            report: list[str] = []
+            converted = convert_transformer_to_fp8(
                 transformer,
                 self.settings.FP8_EXCLUDE_PATTERNS,
                 self.settings.FP8_KEEP_EDGE_BLOCKS,
+                report=report,
             )
+            if report:
+                logger.info(
+                    "FP8 conversion kept %d layer(s) in their original precision: %s",
+                    len(report),
+                    "; ".join(report[:5]),
+                )
+            logger.info("converted %d layer(s) of %r to FP8", converted, key)
 
         if hasattr(transformer, "set_attention_backend"):
             transformer.set_attention_backend("native")
         instrument_transformer(transformer)
 
         self.lora_manager.register(transformer)
-        cache = StepResidualCache().attach(transformer)
-        self.caches[key] = cache
 
         compile_mode = (self.settings.COMPILE_MODE or "").strip()
         if compile_mode and compile_mode.lower() not in ("none", "off", "0", "false"):
             torch._dynamo.config.cache_size_limit = 64
-            _, blocks = find_primary_block_list(transformer)
-            for idx, block in enumerate(blocks):
-                if hasattr(block, "_uncached_forward"):
-                    block.forward = block._uncached_forward
-                compiled_block = torch.compile(
-                    block,
-                    mode=compile_mode,
-                    dynamic=False,
-                    fullgraph=False,
-                )
-                blocks[idx] = compiled_block
-                cache.wrap_block(idx, compiled_block)
+            try:
+                _, blocks = find_primary_block_list(transformer)
+            except ValueError:
+                blocks = None
+            if blocks is not None:
+                for idx, block in enumerate(list(blocks)):
+                    compiled_block = torch.compile(
+                        block,
+                        mode=compile_mode,
+                        dynamic=False,
+                        fullgraph=False,
+                    )
+                    blocks[idx] = compiled_block
+
+        # Attach the step cache *after* compiling so the wrappers sit on top of the
+        # compiled modules instead of being hidden behind them.
+        cache = StepResidualCache()
+        try:
+            cache.attach(transformer)
+        except ValueError as exc:
+            logger.warning("step-residual cache disabled for %r: %s", key, exc)
+        self.caches[key] = cache
 
         self.transformers[key] = transformer
         self.footprints[key] = _module_footprint_bytes(transformer)

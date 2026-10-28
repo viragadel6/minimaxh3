@@ -1,7 +1,10 @@
 import inspect
+import logging
 from collections.abc import Mapping
 
 from shapes import FPS
+
+logger = logging.getLogger(__name__)
 
 
 def _collect_input_names(block, visited: set[int] | None = None) -> set[str]:
@@ -142,7 +145,12 @@ class PipelineAdapter:
             if kwargs:
                 try:
                     return factory(**kwargs)
-                except Exception:
+                except Exception as exc:  # noqa: BLE001 - try the next candidate class
+                    # Candidates are guessed from the pipeline module, so a rejection
+                    # is expected; keep the reason for debugging instead of hiding it.
+                    logger.debug(
+                        "reference factory %r rejected %s: %s", factory, ref_type, exc
+                    )
                     continue
 
         return {
@@ -199,6 +207,7 @@ class PipelineAdapter:
         references: list[dict] | None = None,
         fps: int = FPS,
         output_type: str = "pt",
+        include_audio: bool = True,
     ):
         built_refs = self.build_references(
             first_frame, last_frame, references, num_frames
@@ -219,7 +228,10 @@ class PipelineAdapter:
         if built_refs:
             call_kwargs[self.arg_map["references"]] = built_refs
 
-        out = self.pipe(**call_kwargs, output=["videos", "audio"])
+        # Only ask the pipeline for audio when it is actually used: synthesising it
+        # costs GPU time that a silent request would throw away.
+        requested = ["videos", "audio"] if include_audio else ["videos"]
+        out = self.pipe(**call_kwargs, output=requested)
         if isinstance(out, tuple) and len(out) == 2:
             video, audio = out
         elif isinstance(out, Mapping):
@@ -233,6 +245,8 @@ class PipelineAdapter:
             video = video[0]
         if isinstance(audio, (list, tuple)) and len(audio) == 1:
             audio = audio[0]
+        if not include_audio:
+            audio = None
         return video, audio
 
     def sample_rate(self) -> int:
